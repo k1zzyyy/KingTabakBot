@@ -38,6 +38,9 @@ class ImportState(StatesGroup):
 class DeleteShiftState(StatesGroup):
     waiting_for_user = State()
 
+class ChangeNameState(StatesGroup):
+    waiting_for_new_name = State()
+
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect("king_tabak.db") as db:
@@ -64,6 +67,11 @@ async def save_user(telegram_id, name, role):
 async def update_user_role(telegram_id, new_role):
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("UPDATE users SET role = ? WHERE telegram_id = ?", (new_role, telegram_id))
+        await db.commit()
+
+async def update_user_name(telegram_id, new_name):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute("UPDATE users SET name = ? WHERE telegram_id = ?", (new_name, telegram_id))
         await db.commit()
 
 async def get_all_users():
@@ -109,7 +117,8 @@ def get_main_menu(is_admin=False):
     builder.button(text="📅 Мои смены", callback_data="my_shifts")
     builder.button(text="⏰ Ближайшая смена", callback_data="next_shift")
     builder.button(text="💰 Зарплата", callback_data="salary")
-    builder.button(text="📈 Сменить уровень", callback_data="change_level") 
+    builder.button(text="📈 Сменить ставку", callback_data="change_rate")
+    builder.button(text="✏️ Сменить фамилию", callback_data="change_name")
     if is_admin:
         builder.button(text="⚙️ Админ-панель", callback_data="admin_panel")
     builder.adjust(1)
@@ -122,7 +131,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if user:
         name, role = user
         is_admin = message.from_user.id in ADMIN_IDS
-        await message.answer(f"Привет, {name}!\nТвоя роль: {role}.\nВыбери действие:", reply_markup=get_main_menu(is_admin))
+        # УБРАЛИ ОБРАЩЕНИЕ ПО ИМЕНИ
+        await message.answer(f"Привет!\nТвоя ставка: <b>{role} ₽</b>.\nВыбери действие:", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     else:
         await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
@@ -132,69 +142,72 @@ async def process_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="Продавец LvL1", callback_data="role_lvl1")
-    builder.button(text="Продавец LvL2", callback_data="role_lvl2")
-    builder.button(text="Продавец LvL3", callback_data="role_lvl3")
+    builder.button(text="2800 ₽", callback_data="role_2800")
+    builder.button(text="3100 ₽", callback_data="role_3100")
+    builder.button(text="3500 ₽", callback_data="role_3500")
     builder.adjust(1)
-    await message.answer(f"Отлично, {message.text}. Теперь выбери свою роль:", reply_markup=builder.as_markup())
+    await message.answer("Теперь выбери свою ставку:", reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("role_"))
 async def process_role(callback: types.CallbackQuery, state: FSMContext):
-    role_key = callback.data.split("_")[1]
-    role_names = {
-        'lvl1': 'Продавец LvL1',
-        'lvl2': 'Продавец LvL2',
-        'lvl3': 'Продавец LvL3'
-    }
-    role = role_names.get(role_key, "Неизвестно")
+    role = callback.data.split("_")[1] # Получаем "2800", "3100" или "3500"
     
     user_data = await state.get_data()
     name = user_data.get("name")
     await save_user(callback.from_user.id, name, role)
     
     is_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer(f"Регистрация завершена!\nИмя: {name}\nРоль: {role}", reply_markup=get_main_menu(is_admin))
+    await callback.message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
     await callback.answer()
 
-# --- СМЕНА УРОВНЯ ---
-@dp.callback_query(F.data == "change_level")
-async def btn_change_level(callback: types.CallbackQuery):
+# --- СМЕНА СТАВКИ (ВВЕРХ И ВНИЗ) ---
+@dp.callback_query(F.data == "change_rate")
+async def btn_change_rate(callback: types.CallbackQuery):
     user = await get_user(callback.from_user.id)
     if not user: return
     name, role = user
 
     builder = InlineKeyboardBuilder()
 
-    if role == "Продавец LvL1":
-        builder.button(text="Стать Продавцом LvL2 (3100 ₽)", callback_data="upgrade_lvl2")
-        builder.button(text="🔙 Отмена", callback_data="back_to_main")
-        builder.adjust(1)
-        await callback.message.answer("Твой текущий уровень: <b>LvL1</b>.\nХочешь повыситься до LvL2?", reply_markup=builder.as_markup(), parse_mode="HTML")
-    elif role == "Продавец LvL2":
-        builder.button(text="Стать Продавцом LvL3 (3500 ₽)", callback_data="upgrade_lvl3")
-        builder.button(text="🔙 Отмена", callback_data="back_to_main")
-        builder.adjust(1)
-        await callback.message.answer("Твой текущий уровень: <b>LvL2</b>.\nХочешь повыситься до LvL3?", reply_markup=builder.as_markup(), parse_mode="HTML")
-    elif role == "Продавец LvL3":
-        builder.button(text="🔙 В меню", callback_data="back_to_main")
-        await callback.message.answer("Ты уже на максимальном уровне (<b>LvL3</b>)! 🏆", reply_markup=builder.as_markup(), parse_mode="HTML")
-    else:
-        await callback.message.answer(f"Твоя роль: {role}. Повышение доступно только для продавцов.")
+    if role == "2800":
+        builder.button(text="⬆️ Повысить до 3100 ₽", callback_data="rate_3100")
+    elif role == "3100":
+        builder.button(text="⬇️ Понизить до 2800 ₽", callback_data="rate_2800")
+        builder.button(text="⬆️ Повысить до 3500 ₽", callback_data="rate_3500")
+    elif role == "3500":
+        builder.button(text="⬇️ Понизить до 3100 ₽", callback_data="rate_3100")
     
+    builder.button(text="🔙 Отмена", callback_data="back_to_main")
+    builder.adjust(1)
+    
+    await callback.message.answer(f"Твоя текущая ставка: <b>{role} ₽</b>.\nЧто хочешь сделать?", reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("upgrade_"))
-async def process_upgrade(callback: types.CallbackQuery):
-    new_lvl = callback.data.split("_")[1]
-    role_names = {'lvl2': 'Продавец LvL2', 'lvl3': 'Продавец LvL3'}
-    new_role = role_names[new_lvl]
-
-    await update_user_role(callback.from_user.id, new_role)
+@dp.callback_query(F.data.startswith("rate_"))
+async def process_rate_change(callback: types.CallbackQuery):
+    new_rate = callback.data.split("_")[1]
+    await update_user_role(callback.from_user.id, new_rate)
 
     is_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer(f"🎉 Поздравляю! Твой уровень повышен до <b>{new_role}</b>!", parse_mode="HTML", reply_markup=get_main_menu(is_admin))
+    await callback.message.answer(f"✅ Твоя ставка изменена на <b>{new_rate} ₽</b>!", parse_mode="HTML", reply_markup=get_main_menu(is_admin))
     await callback.answer()
+
+# --- СМЕНА ФАМИЛИИ ---
+@dp.callback_query(F.data == "change_name")
+async def btn_change_name(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи свою новую <b>Фамилию</b> (так, как она указана в таблице расписания):", parse_mode="HTML")
+    await state.set_state(ChangeNameState.waiting_for_new_name)
+    await callback.answer()
+
+@dp.message(ChangeNameState.waiting_for_new_name)
+async def process_change_name(message: types.Message, state: FSMContext):
+    new_name = message.text.strip()
+    await update_user_name(message.from_user.id, new_name)
+    
+    is_admin = message.from_user.id in ADMIN_IDS
+    await message.answer(f"✅ Твоя фамилия изменена на <b>{new_name}</b>!", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+    await state.clear()
 
 # --- МОИ СМЕНЫ ---
 @dp.callback_query(F.data == "my_shifts")
@@ -263,18 +276,18 @@ async def btn_salary(callback: types.CallbackQuery):
         async with db.execute("SELECT COUNT(*) FROM shifts WHERE user_id = ? AND date >= ? AND date < ?", (callback.from_user.id, start_str, end_str)) as cursor:
             count = (await cursor.fetchone())[0]
 
-    rates = {
-        'продавец lvl1': 2800,
-        'продавец lvl2': 3100,
-        'продавец lvl3': 3500
-    }
-    rate = rates.get(role.lower(), 0)
+    # Ставка теперь берется напрямую из базы (там строка "3100" и т.д.)
+    try:
+        rate = int(role)
+    except ValueError:
+        rate = 0
+        
     total = count * rate
 
     text = (f"💰 <b>Расчет зарплаты:</b>\n\n"
             f"Период: с {start_date.strftime('%d.%m')} по {(end_date - timedelta(days=1)).strftime('%d.%m')}\n"
             f"Выплата: <b>{payout_str}</b>\n"
-            f"Твоя роль: {role} (ставка {rate} ₽)\n"
+            f"Твоя ставка: <b>{rate} ₽</b>\n"
             f"Отработано смен: {count}\n\n"
             f"<b>К выплате: {total} ₽</b>")
     await callback.message.answer(text, parse_mode="HTML")
@@ -288,7 +301,7 @@ async def btn_admin_panel(callback: types.CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Добавить смену", callback_data="add_shift")
-    builder.button(text="❌ Удалить смену", callback_data="delete_shift") # ТОЛЬКО ЗДЕСЬ
+    builder.button(text="❌ Удалить смену", callback_data="delete_shift")
     builder.button(text="🌐 Загрузить из Google Таблиц", callback_data="import_gsheet")
     builder.button(text="🗑 Очистить ВСЁ расписание", callback_data="clear_shifts")
     builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
@@ -313,7 +326,7 @@ async def btn_delete_shift(callback: types.CallbackQuery, state: FSMContext):
         return
     builder = InlineKeyboardBuilder()
     for uid, name, role in users:
-        builder.button(text=name, callback_data=f"deluser_{uid}")
+        builder.button(text=f"{name} ({role}₽)", callback_data=f"deluser_{uid}")
     builder.adjust(2)
     await callback.message.answer("У кого удаляем смену? Выбери сотрудника:", reply_markup=builder.as_markup())
     await state.set_state(DeleteShiftState.waiting_for_user)
