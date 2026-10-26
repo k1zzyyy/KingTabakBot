@@ -17,7 +17,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdmiCfg-6fTdd8PVGmKJQZgYUInzQodiRvZ5Ken1r2_Uh3SwbP87ZtuQwZ9Mcm6rRJ9cO7dh7Qso78/pub?output=csv")
 ADMIN_IDS = [7088621971] # ID Захара
 
-# Создаем бота БЕЗ прокси (на сервере он не нужен)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -35,6 +34,9 @@ class AddShiftState(StatesGroup):
 
 class ImportState(StatesGroup):
     waiting_for_gsheet_date = State()
+
+class DeleteShiftState(StatesGroup):
+    waiting_for_user = State()
 
 # --- БАЗА ДАННЫХ ---
 async def init_db():
@@ -59,9 +61,14 @@ async def save_user(telegram_id, name, role):
         await db.execute("INSERT OR REPLACE INTO users (telegram_id, name, role) VALUES (?, ?, ?)", (telegram_id, name, role))
         await db.commit()
 
+async def update_user_role(telegram_id, new_role):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute("UPDATE users SET role = ? WHERE telegram_id = ?", (new_role, telegram_id))
+        await db.commit()
+
 async def get_all_users():
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT telegram_id, name FROM users") as cursor:
+        async with db.execute("SELECT telegram_id, name, role FROM users") as cursor:
             return await cursor.fetchall()
 
 async def add_shift_to_db(user_id, date_str, shift_type, address, replaces, replaced_by):
@@ -74,7 +81,7 @@ async def add_shift_to_db(user_id, date_str, shift_type, address, replaces, repl
 
 async def get_user_shifts(user_id):
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? ORDER BY date", (user_id,)) as cursor:
+        async with db.execute("SELECT id, date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? ORDER BY date", (user_id,)) as cursor:
             return await cursor.fetchall()
 
 async def get_next_shift(user_id):
@@ -85,6 +92,11 @@ async def get_next_shift(user_id):
             (user_id, today_str)
         ) as cursor:
             return await cursor.fetchone()
+
+async def delete_shift_by_id(shift_id):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute("DELETE FROM shifts WHERE id = ?", (shift_id,))
+        await db.commit()
 
 async def clear_all_shifts():
     async with aiosqlite.connect("king_tabak.db") as db:
@@ -97,6 +109,7 @@ def get_main_menu(is_admin=False):
     builder.button(text="📅 Мои смены", callback_data="my_shifts")
     builder.button(text="⏰ Ближайшая смена", callback_data="next_shift")
     builder.button(text="💰 Зарплата", callback_data="salary")
+    builder.button(text="📈 Сменить уровень", callback_data="change_level") 
     if is_admin:
         builder.button(text="⚙️ Админ-панель", callback_data="admin_panel")
     builder.adjust(1)
@@ -109,14 +122,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if user:
         name, role = user
         is_admin = message.from_user.id in ADMIN_IDS
-        await message.answer(f"Привет, {name}! Твоя роль: {role}.\nВыбери действие:", reply_markup=get_main_menu(is_admin))
+        await message.answer(f"Привет, {name}!\nТвоя роль: {role}.\nВыбери действие:", reply_markup=get_main_menu(is_admin))
     else:
-        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице расписания):", parse_mode="HTML")
+        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
 
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text)
+    await state.update_data(name=message.text.strip())
+    
     builder = InlineKeyboardBuilder()
     builder.button(text="Продавец LvL1", callback_data="role_lvl1")
     builder.button(text="Продавец LvL2", callback_data="role_lvl2")
@@ -143,6 +157,45 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
+# --- СМЕНА УРОВНЯ ---
+@dp.callback_query(F.data == "change_level")
+async def btn_change_level(callback: types.CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    if not user: return
+    name, role = user
+
+    builder = InlineKeyboardBuilder()
+
+    if role == "Продавец LvL1":
+        builder.button(text="Стать Продавцом LvL2 (3100 ₽)", callback_data="upgrade_lvl2")
+        builder.button(text="🔙 Отмена", callback_data="back_to_main")
+        builder.adjust(1)
+        await callback.message.answer("Твой текущий уровень: <b>LvL1</b>.\nХочешь повыситься до LvL2?", reply_markup=builder.as_markup(), parse_mode="HTML")
+    elif role == "Продавец LvL2":
+        builder.button(text="Стать Продавцом LvL3 (3500 ₽)", callback_data="upgrade_lvl3")
+        builder.button(text="🔙 Отмена", callback_data="back_to_main")
+        builder.adjust(1)
+        await callback.message.answer("Твой текущий уровень: <b>LvL2</b>.\nХочешь повыситься до LvL3?", reply_markup=builder.as_markup(), parse_mode="HTML")
+    elif role == "Продавец LvL3":
+        builder.button(text="🔙 В меню", callback_data="back_to_main")
+        await callback.message.answer("Ты уже на максимальном уровне (<b>LvL3</b>)! 🏆", reply_markup=builder.as_markup(), parse_mode="HTML")
+    else:
+        await callback.message.answer(f"Твоя роль: {role}. Повышение доступно только для продавцов.")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("upgrade_"))
+async def process_upgrade(callback: types.CallbackQuery):
+    new_lvl = callback.data.split("_")[1]
+    role_names = {'lvl2': 'Продавец LvL2', 'lvl3': 'Продавец LvL3'}
+    new_role = role_names[new_lvl]
+
+    await update_user_role(callback.from_user.id, new_role)
+
+    is_admin = callback.from_user.id in ADMIN_IDS
+    await callback.message.answer(f"🎉 Поздравляю! Твой уровень повышен до <b>{new_role}</b>!", parse_mode="HTML", reply_markup=get_main_menu(is_admin))
+    await callback.answer()
+
 # --- МОИ СМЕНЫ ---
 @dp.callback_query(F.data == "my_shifts")
 async def btn_my_shifts(callback: types.CallbackQuery):
@@ -152,7 +205,7 @@ async def btn_my_shifts(callback: types.CallbackQuery):
     else:
         text = "📅 <b>Твои смены:</b>\n\n"
         for s in shifts:
-            date_str, s_type, addr, repl, repl_by = s
+            _, date_str, s_type, addr, repl, repl_by = s
             text += f"📆 {date_str} ({s_type})\n📍 {addr}\n🔄 Сменяю: {repl}\n👤 Сменяет: {repl_by}\n\n"
         await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
@@ -211,9 +264,9 @@ async def btn_salary(callback: types.CallbackQuery):
             count = (await cursor.fetchone())[0]
 
     rates = {
-        'продавец lvl1': 2800, 'стажер': 2800,
-        'продавец lvl2': 3100, 'продавец': 3100,
-        'продавец lvl3': 3500, 'экзаминированный': 3500
+        'продавец lvl1': 2800,
+        'продавец lvl2': 3100,
+        'продавец lvl3': 3500
     }
     rate = rates.get(role.lower(), 0)
     total = count * rate
@@ -235,18 +288,12 @@ async def btn_admin_panel(callback: types.CallbackQuery):
         return
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Добавить смену", callback_data="add_shift")
+    builder.button(text="❌ Удалить смену", callback_data="delete_shift") # ТОЛЬКО ЗДЕСЬ
     builder.button(text="🌐 Загрузить из Google Таблиц", callback_data="import_gsheet")
-    builder.button(text="🗑 Очистить всё расписание", callback_data="clear_shifts")
+    builder.button(text="🗑 Очистить ВСЁ расписание", callback_data="clear_shifts")
     builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
     builder.adjust(1)
     await callback.message.answer("⚙️ Админ-панель:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data == "clear_shifts")
-async def btn_clear_shifts(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS: return
-    await clear_all_shifts()
-    await callback.message.answer("🗑 Все смены удалены из базы! Теперь можно загрузить новое расписание.")
     await callback.answer()
 
 @dp.callback_query(F.data == "back_to_main")
@@ -256,16 +303,67 @@ async def btn_back_to_main(callback: types.CallbackQuery):
     await callback.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
     await callback.answer()
 
+# --- УДАЛЕНИЕ КОНКРЕТНОЙ СМЕНЫ (ДЛЯ АДМИНА) ---
+@dp.callback_query(F.data == "delete_shift")
+async def btn_delete_shift(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    users = await get_all_users()
+    if not users:
+        await callback.message.answer("В базе нет пользователей.")
+        return
+    builder = InlineKeyboardBuilder()
+    for uid, name, role in users:
+        builder.button(text=name, callback_data=f"deluser_{uid}")
+    builder.adjust(2)
+    await callback.message.answer("У кого удаляем смену? Выбери сотрудника:", reply_markup=builder.as_markup())
+    await state.set_state(DeleteShiftState.waiting_for_user)
+    await callback.answer()
+
+@dp.callback_query(DeleteShiftState.waiting_for_user, F.data.startswith("deluser_"))
+async def process_delete_user(callback: types.CallbackQuery, state: FSMContext):
+    user_id = int(callback.data.split("_")[1])
+    shifts = await get_user_shifts(user_id)
+    
+    if not shifts:
+        await callback.message.answer("У этого сотрудника нет смен.")
+        await state.clear()
+        return
+
+    builder = InlineKeyboardBuilder()
+    for shift in shifts:
+        s_id, s_date, s_type, s_addr, _, _ = shift
+        builder.button(text=f"❌ {s_date} ({s_type}) - {s_addr}", callback_data=f"delshift_{s_id}")
+    builder.button(text="🔙 Отмена", callback_data="admin_panel")
+    builder.adjust(1)
+    
+    await callback.message.answer("Выбери смену для удаления:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delshift_"))
+async def process_delete_shift(callback: types.CallbackQuery, state: FSMContext):
+    shift_id = int(callback.data.split("_")[1])
+    await delete_shift_by_id(shift_id)
+    await callback.message.answer("✅ Смена успешно удалена из базы!")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data == "clear_shifts")
+async def btn_clear_shifts(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS: return
+    await clear_all_shifts()
+    await callback.message.answer("🗑 Все смены удалены из базы!")
+    await callback.answer()
+
 # --- ДОБАВЛЕНИЕ СМЕНЫ (FSM) ---
 @dp.callback_query(F.data == "add_shift")
 async def btn_add_shift(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     users = await get_all_users()
     if not users:
-        await callback.message.answer("В базе нет пользователей. Сначала пусть они зарегистрируются.")
+        await callback.message.answer("В базе нет пользователей.")
         return
     builder = InlineKeyboardBuilder()
-    for uid, name in users:
+    for uid, name, role in users:
         builder.button(text=name, callback_data=f"shift_user_{uid}")
     builder.adjust(2)
     await callback.message.answer("Кому добавляем смену? Выбери сотрудника:", reply_markup=builder.as_markup())
@@ -276,7 +374,7 @@ async def btn_add_shift(callback: types.CallbackQuery, state: FSMContext):
 async def process_shift_user(callback: types.CallbackQuery, state: FSMContext):
     user_id = int(callback.data.split("_")[2])
     await state.update_data(target_user_id=user_id)
-    await callback.message.answer("Введи дату смены в формате <b>ГГГГ-ММ-ДД</b> (например, 2026-11-05):", parse_mode="HTML")
+    await callback.message.answer("Введи дату смены в формате <b>ГГГГ-ММ-ДД</b>:", parse_mode="HTML")
     await state.set_state(AddShiftState.waiting_for_date)
     await callback.answer()
 
@@ -321,7 +419,7 @@ async def process_shift_replaced_by(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "import_gsheet")
 async def btn_import_gsheet(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
-    await callback.message.answer("Введи месяц и год, на который составлено расписание (например: <b>10 2026</b> для октября 2026):", parse_mode="HTML")
+    await callback.message.answer("Введи месяц и год, на который составлено расписание (например: <b>10 2026</b>):", parse_mode="HTML")
     await state.set_state(ImportState.waiting_for_gsheet_date)
     await callback.answer()
 
@@ -332,13 +430,12 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
         month = int(month_str)
         year = int(year_str)
     except ValueError:
-        await message.answer("❌ Неверный формат. Напиши два числа через пробел: месяц (1-12) и год (например, 10 2026).")
+        await message.answer("❌ Неверный формат. Напиши два числа через пробел: месяц (1-12) и год.")
         return
 
     await message.answer("⏳ Скачиваю и парсю Google Таблицу, подожди...")
 
     try:
-        # ВНИМАНИЕ: proxy=PROXY_URL убран, так как на сервере он не нужен
         async with aiohttp.ClientSession() as session_http:
             async with session_http.get(SHEET_CSV_URL) as response:
                 if response.status != 200:
@@ -351,7 +448,6 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
             return
 
         f = io.StringIO(text)
-        
         delimiter = ','
         first_line = text.split('\n')[0]
         if first_line.count(';') > first_line.count(','):
@@ -438,7 +534,7 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
             result_text = f"⚠️ Этих людей нет в базе (всего {total_missing} чел.):\n{preview}"
             if total_missing > 15:
                 result_text += f"\n... и еще {total_missing - 15} человек."
-            result_text += "\n\n(Они должны нажать /start и зарегистрироваться под этими фамилиями, чтобы бот их видел)."
+            result_text += "\n\n(Они должны нажать /start и зарегистрироваться)."
             await message.answer(result_text)
             
     except Exception as e:
@@ -449,7 +545,7 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
 # --- ЗАПУСК ---
 async def main():
     await init_db()
-    print("Бот запущен...")
+    print("Бот запущен...", flush=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
