@@ -46,6 +46,12 @@ async def init_db():
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, name TEXT, role TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS shifts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, date TEXT, shift_type TEXT, address TEXT, replaces TEXT, replaced_by TEXT)")
+        
+        # 🛠️ АВТОМАТИЧЕСКАЯ МИГРАЦИЯ СТАРЫХ РОЛЕЙ В СТАВКИ
+        await db.execute("UPDATE users SET role = '2800' WHERE role LIKE '%LvL1%' OR role = 'стажер' OR role = 'Стажер'")
+        await db.execute("UPDATE users SET role = '3100' WHERE role LIKE '%LvL2%' OR role = 'продавец' OR role = 'Продавец'")
+        await db.execute("UPDATE users SET role = '3500' WHERE role LIKE '%LvL3%' OR role = 'экзаминированный' OR role = 'Экзаминированный'")
+        
         await db.commit()
 
 async def get_user(telegram_id):
@@ -131,8 +137,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if user:
         name, role = user
         is_admin = message.from_user.id in ADMIN_IDS
-        # УБРАЛИ ОБРАЩЕНИЕ ПО ИМЕНИ
-        await message.answer(f"Привет!\nТвоя ставка: <b>{role} ₽</b>.\nВыбери действие:", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+        # Проверка, что роль - это число. Если вдруг остался мусор, пишем 0.
+        try:
+            rate_val = int(role)
+        except (ValueError, TypeError):
+            rate_val = 0
+
+        await message.answer(f"Привет!\nТвоя ставка: <b>{rate_val} ₽</b>.\nВыбери действие:", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     else:
         await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
@@ -170,18 +181,28 @@ async def btn_change_rate(callback: types.CallbackQuery):
 
     builder = InlineKeyboardBuilder()
 
-    if role == "2800":
-        builder.button(text="⬆️ Повысить до 3100 ₽", callback_data="rate_3100")
-    elif role == "3100":
-        builder.button(text="⬇️ Понизить до 2800 ₽", callback_data="rate_2800")
-        builder.button(text="⬆️ Повысить до 3500 ₽", callback_data="rate_3500")
-    elif role == "3500":
-        builder.button(text="⬇️ Понизить до 3100 ₽", callback_data="rate_3100")
+    # Если в базе мусор, предлагаем выбрать всё заново
+    if role not in ("2800", "3100", "3500"):
+        builder.button(text="Ставка 2800 ₽", callback_data="rate_2800")
+        builder.button(text="Ставка 3100 ₽", callback_data="rate_3100")
+        builder.button(text="Ставка 3500 ₽", callback_data="rate_3500")
+        msg_text = "Похоже, твоя ставка сбилась после обновления. Выбери её заново:"
+    else:
+        if role == "2800":
+            builder.button(text="⬆️ Повысить до 3100 ₽", callback_data="rate_3100")
+            msg_text = "Твоя текущая ставка: <b>2800 ₽</b>.\nХочешь повысить?"
+        elif role == "3100":
+            builder.button(text="⬇️ Понизить до 2800 ₽", callback_data="rate_2800")
+            builder.button(text="⬆️ Повысить до 3500 ₽", callback_data="rate_3500")
+            msg_text = "Твоя текущая ставка: <b>3100 ₽</b>.\nЧто хочешь сделать?"
+        elif role == "3500":
+            builder.button(text="⬇️ Понизить до 3100 ₽", callback_data="rate_3100")
+            msg_text = "Твоя текущая ставка: <b>3500 ₽</b>.\nХочешь понизить?"
     
     builder.button(text="🔙 Отмена", callback_data="back_to_main")
     builder.adjust(1)
     
-    await callback.message.answer(f"Твоя текущая ставка: <b>{role} ₽</b>.\nЧто хочешь сделать?", reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.message.answer(msg_text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("rate_"))
@@ -276,10 +297,10 @@ async def btn_salary(callback: types.CallbackQuery):
         async with db.execute("SELECT COUNT(*) FROM shifts WHERE user_id = ? AND date >= ? AND date < ?", (callback.from_user.id, start_str, end_str)) as cursor:
             count = (await cursor.fetchone())[0]
 
-    # Ставка теперь берется напрямую из базы (там строка "3100" и т.д.)
+    # Безопасное извлечение ставки
     try:
         rate = int(role)
-    except ValueError:
+    except (ValueError, TypeError):
         rate = 0
         
     total = count * rate
