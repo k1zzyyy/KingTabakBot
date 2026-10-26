@@ -5,6 +5,7 @@ import csv
 import io
 import aiohttp
 from datetime import date, datetime, timedelta
+from collections import defaultdict
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -47,7 +48,7 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, name TEXT, role TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS shifts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, date TEXT, shift_type TEXT, address TEXT, replaces TEXT, replaced_by TEXT)")
         
-        # 🛠️ АВТОМАТИЧЕСКАЯ МИГРАЦИЯ СТАРЫХ РОЛЕЙ В СТАВКИ
+        # Миграция старых ролей
         await db.execute("UPDATE users SET role = '2800' WHERE role LIKE '%LvL1%' OR role = 'стажер' OR role = 'Стажер'")
         await db.execute("UPDATE users SET role = '3100' WHERE role LIKE '%LvL2%' OR role = 'продавец' OR role = 'Продавец'")
         await db.execute("UPDATE users SET role = '3500' WHERE role LIKE '%LvL3%' OR role = 'экзаминированный' OR role = 'Экзаминированный'")
@@ -85,13 +86,22 @@ async def get_all_users():
         async with db.execute("SELECT telegram_id, name, role FROM users") as cursor:
             return await cursor.fetchall()
 
+async def check_shift_exists(user_id, date_str, shift_type):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        async with db.execute("SELECT id FROM shifts WHERE user_id = ? AND date = ? AND shift_type = ?", (user_id, date_str, shift_type)) as cursor:
+            return await cursor.fetchone() is not None
+
 async def add_shift_to_db(user_id, date_str, shift_type, address, replaces, replaced_by):
+    if await check_shift_exists(user_id, date_str, shift_type):
+        return False 
+        
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute(
             "INSERT INTO shifts (user_id, date, shift_type, address, replaces, replaced_by) VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, date_str, shift_type, address, replaces, replaced_by)
         )
         await db.commit()
+        return True
 
 async def get_user_shifts(user_id):
     async with aiosqlite.connect("king_tabak.db") as db:
@@ -137,7 +147,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if user:
         name, role = user
         is_admin = message.from_user.id in ADMIN_IDS
-        # Проверка, что роль - это число. Если вдруг остался мусор, пишем 0.
         try:
             rate_val = int(role)
         except (ValueError, TypeError):
@@ -161,18 +170,18 @@ async def process_name(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("role_"))
 async def process_role(callback: types.CallbackQuery, state: FSMContext):
-    role = callback.data.split("_")[1] # Получаем "2800", "3100" или "3500"
+    role = callback.data.split("_")[1]
     
     user_data = await state.get_data()
     name = user_data.get("name")
     await save_user(callback.from_user.id, name, role)
     
     is_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+    await callback.message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>\n\n(Если админ уже загружал расписание, попроси его загрузить его еще раз, чтобы смены появились).", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
     await callback.answer()
 
-# --- СМЕНА СТАВКИ (ВВЕРХ И ВНИЗ) ---
+# --- СМЕНА СТАВКИ ---
 @dp.callback_query(F.data == "change_rate")
 async def btn_change_rate(callback: types.CallbackQuery):
     user = await get_user(callback.from_user.id)
@@ -181,7 +190,6 @@ async def btn_change_rate(callback: types.CallbackQuery):
 
     builder = InlineKeyboardBuilder()
 
-    # Если в базе мусор, предлагаем выбрать всё заново
     if role not in ("2800", "3100", "3500"):
         builder.button(text="Ставка 2800 ₽", callback_data="rate_2800")
         builder.button(text="Ставка 3100 ₽", callback_data="rate_3100")
@@ -227,7 +235,7 @@ async def process_change_name(message: types.Message, state: FSMContext):
     await update_user_name(message.from_user.id, new_name)
     
     is_admin = message.from_user.id in ADMIN_IDS
-    await message.answer(f"✅ Твоя фамилия изменена на <b>{new_name}</b>!", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+    await message.answer(f"✅ Твоя фамилия изменена на <b>{new_name}</b>!\n(Попроси админа загрузить расписание заново, чтобы получить смены).", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
 
 # --- МОИ СМЕНЫ ---
@@ -235,7 +243,7 @@ async def process_change_name(message: types.Message, state: FSMContext):
 async def btn_my_shifts(callback: types.CallbackQuery):
     shifts = await get_user_shifts(callback.from_user.id)
     if not shifts:
-        await callback.message.answer("У тебя пока нет смен в расписании.")
+        await callback.message.answer("У тебя пока нет смен в расписании. (Если админ только что загрузил его, а смен нет — возможно, твоей фамилии нет в таблице или ты написал её с ошибкой).")
     else:
         text = "📅 <b>Твои смены:</b>\n\n"
         for s in shifts:
@@ -297,7 +305,6 @@ async def btn_salary(callback: types.CallbackQuery):
         async with db.execute("SELECT COUNT(*) FROM shifts WHERE user_id = ? AND date >= ? AND date < ?", (callback.from_user.id, start_str, end_str)) as cursor:
             count = (await cursor.fetchone())[0]
 
-    # Безопасное извлечение ставки
     try:
         rate = int(role)
     except (ValueError, TypeError):
@@ -445,11 +452,16 @@ async def process_shift_replaces(message: types.Message, state: FSMContext):
 async def process_shift_replaced_by(message: types.Message, state: FSMContext):
     await state.update_data(replaced_by=message.text)
     data = await state.get_data()
-    await add_shift_to_db(data['target_user_id'], data['date'], data['shift_type'], data['address'], data['replaces'], message.text)
-    await message.answer("✅ Смена успешно добавлена в базу!", reply_markup=get_main_menu(True))
+    
+    added = await add_shift_to_db(data['target_user_id'], data['date'], data['shift_type'], data['address'], data['replaces'], message.text)
+    
+    if added:
+        await message.answer("✅ Смена успешно добавлена в базу!", reply_markup=get_main_menu(True))
+    else:
+        await message.answer("⚠️ Такая смена (на эту дату и с этим типом) уже существует в базе!", reply_markup=get_main_menu(True))
     await state.clear()
 
-# --- ИМПОРТ ИЗ GOOGLE SHEETS ---
+# --- ИМПОРТ ИЗ GOOGLE SHEETS С АВТОМАТИЧЕСКИМ ПОИСКОМ СМЕНЩИКОВ ---
 @dp.callback_query(F.data == "import_gsheet")
 async def btn_import_gsheet(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -516,10 +528,10 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
             await message.answer(f"❌ Не удалось найти даты. Вот строка заголовка:\n<code>{day_headers}</code>", parse_mode="HTML")
             return
 
-        success_count = 0
+        # 1. СОБИРАЕМ ВСЕ СМЕНЫ В ОДИН СПИСОК (в память)
+        parsed_shifts = []
         missing_names = set() 
         current_address = ""
-        notified_users = set()
         
         for row in rows[header_row_index + 1:]:
             if len(row) < 2: continue
@@ -543,23 +555,64 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
                         user_id = user[0]
                         try:
                             shift_date = datetime(year, month, day_num).strftime("%Y-%m-%d")
-                            await add_shift_to_db(user_id, shift_date, shift_type, current_address, "-", "-")
-                            success_count += 1
-                            notified_users.add(user_id)
+                            parsed_shifts.append({
+                                'user_id': user_id,
+                                'name': cell_value,
+                                'date': shift_date,
+                                'shift_type': shift_type,
+                                'address': current_address
+                            })
                         except Exception:
                             pass
                     else:
                         missing_names.add(cell_value)
 
-        if success_count > 0:
-            await message.answer(f"✅ Импорт завершен! Добавлено смен: {success_count}.\n\n📨 Отправляю уведомления...")
+        # 2. ГРУППИРУЕМ И СОРТИРУЕМ ПО АДРЕСАМ
+        locations = defaultdict(list)
+        for shift in parsed_shifts:
+            locations[shift['address']].append(shift)
+
+        def sort_key(s):
+            # Сначала по дате, потом "День" (0) раньше "Ночь" (1)
+            type_weight = 0 if "День" in s['shift_type'] else 1
+            return (s['date'], type_weight)
+
+        success_count = 0
+        notified_users = set()
+
+        # 3. РАССТАВЛЯЕМ СМЕНЩИКОВ И СОХРАНЯЕМ В БАЗУ
+        for addr, shifts in locations.items():
+            shifts.sort(key=sort_key) # Сортируем цепочку
+            
+            for i in range(len(shifts)):
+                # Кого сменяет - берем предыдущего в цепочке
+                replaces_name = shifts[i-1]['name'] if i > 0 else "-"
+                # Кто сменяет - берем следующего в цепочке
+                replaced_by_name = shifts[i+1]['name'] if i < len(shifts) - 1 else "-"
+                
+                added = await add_shift_to_db(
+                    shifts[i]['user_id'], 
+                    shifts[i]['date'], 
+                    shifts[i]['shift_type'], 
+                    shifts[i]['address'], 
+                    replaces_name, 
+                    replaced_by_name
+                )
+                if added:
+                    success_count += 1
+                    notified_users.add(shifts[i]['user_id'])
+
+        # Вывод результата
+        result_msg = f"✅ Импорт завершен!\nДобавлено новых смен: {success_count}."
+        await message.answer(result_msg)
+        
+        if notified_users:
+            await message.answer("📨 Отправляю уведомления...")
             for uid in notified_users:
                 try:
                     await bot.send_message(uid, "🔔 <b>Внимание!</b> Обновлено расписание смен.\nЗайди в бота и нажми «📅 Мои смены».", parse_mode="HTML")
                 except Exception:
                     pass
-        else:
-            await message.answer("⚠️ Импорт прошел, но не добавлено ни одной смены (никого из таблицы нет в базе).")
         
         if missing_names:
             missing_list = list(missing_names)
