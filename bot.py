@@ -46,22 +46,32 @@ class DeleteShiftState(StatesGroup):
 class ChangeNameState(StatesGroup):
     waiting_for_new_name = State()
 
+class TransactionState(StatesGroup):
+    waiting_for_fine = State()
+    waiting_for_bonus = State()
+
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, name TEXT, role TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS shifts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, date TEXT, shift_type TEXT, address TEXT, replaces TEXT, replaced_by TEXT)")
-        # Таблица настроек (для автосинхронизации)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                user_id INTEGER, 
+                type TEXT, 
+                amount INTEGER, 
+                date TEXT
+            )
+        """)
         await db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         
-        # Миграция старых ролей
         await db.execute("UPDATE users SET role = '2800' WHERE role LIKE '%LvL1%' OR role = 'стажер' OR role = 'Стажер'")
         await db.execute("UPDATE users SET role = '3100' WHERE role LIKE '%LvL2%' OR role = 'продавец' OR role = 'Продавец'")
         await db.execute("UPDATE users SET role = '3500' WHERE role LIKE '%LvL3%' OR role = 'экзаминированный' OR role = 'Экзаминированный'")
         
         await db.commit()
 
-# --- ФУНКЦИИ НАСТРОЕК ---
 async def get_setting(key):
     async with aiosqlite.connect("king_tabak.db") as db:
         async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
@@ -146,7 +156,24 @@ async def clear_shifts_for_month(month, year):
         await db.execute("DELETE FROM shifts WHERE date LIKE ?", (prefix,))
         await db.commit()
 
-# --- ОБЩАЯ ФУНКЦИЯ ПАРСИНГА (Используется и кнопкой, и автосинхронизацией) ---
+async def add_transaction(user_id, t_type, amount, date_str):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute(
+            "INSERT INTO transactions (user_id, type, amount, date) VALUES (?, ?, ?, ?)",
+            (user_id, t_type, amount, date_str)
+        )
+        await db.commit()
+
+async def get_transactions_sum(user_id, start_date, end_date, t_type):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        async with db.execute(
+            "SELECT SUM(amount) FROM transactions WHERE user_id = ? AND type = ? AND date >= ? AND date <= ?",
+            (user_id, t_type, start_date, end_date)
+        ) as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result[0] else 0
+
+# --- ПАРСИНГ ТАБЛИЦЫ ---
 async def process_and_save_sheet(month, year, is_auto=False):
     try:
         async with aiohttp.ClientSession() as session_http:
@@ -158,7 +185,6 @@ async def process_and_save_sheet(month, year, is_auto=False):
         if "<html" in text.lower() or "<!doctype html" in text.lower():
             return False, "Ошибка: По ссылке скачалась веб-страница."
 
-        # ПРОВЕРКА НА ИЗМЕНЕНИЯ (Хэш)
         current_hash = hashlib.md5(text.encode()).hexdigest()
         last_hash = await get_setting("last_sheet_hash")
         
@@ -246,7 +272,6 @@ async def process_and_save_sheet(month, year, is_auto=False):
         success_count = 0
         notified_users = set()
 
-        # АВТО-ОЧИСТКА СТАРЫХ СМЕН
         await clear_shifts_for_month(month, year)
 
         for addr, shifts in locations.items():
@@ -268,10 +293,8 @@ async def process_and_save_sheet(month, year, is_auto=False):
                         success_count += 1
                         notified_users.add(shifts[i]['user_id'])
 
-        # Сохраняем хэш
         await set_setting("last_sheet_hash", current_hash)
         
-        # Отправляем уведомления (только если это ручной запуск или данные изменились)
         if notified_users:
             for uid in notified_users:
                 try:
@@ -290,20 +313,16 @@ async def process_and_save_sheet(month, year, is_auto=False):
     except Exception as e:
         return False, f"Ошибка при чтении: {str(e)}"
 
-# --- ФОНОВАЯ АВТОСИНХРОНИЗАЦИЯ ---
 async def auto_sync_worker():
     while True:
-        await asyncio.sleep(600) # Проверка каждые 600 секунд
+        await asyncio.sleep(600) 
         try:
             sync_month = await get_setting("sync_month")
             sync_year = await get_setting("sync_year")
             if sync_month and sync_year:
-                print(f"[АВТОСИНХРОНИЗАЦИЯ] Проверяю таблицу за {sync_month}.{sync_year}...")
                 success, msg = await process_and_save_sheet(int(sync_month), int(sync_year), is_auto=True)
-                if success:
-                    print(f"[АВТОСИНХРОНИЗАЦИЯ] Успешно: {msg}")
-        except Exception as e:
-            print(f"[АВТОСИНХРОНИЗАЦИЯ] Ошибка: {e}")
+        except Exception:
+            pass
 
 # --- МЕНЮ ---
 def get_main_menu(is_admin=False):
@@ -311,6 +330,8 @@ def get_main_menu(is_admin=False):
     builder.button(text="📅 Мои смены", callback_data="my_shifts")
     builder.button(text="⏰ Ближайшая смена", callback_data="next_shift")
     builder.button(text="💰 Зарплата", callback_data="salary")
+    builder.button(text="🔻 Штраф", callback_data="add_fine")
+    builder.button(text="🔺 Докид", callback_data="add_bonus")
     builder.button(text="📈 Сменить ставку", callback_data="change_rate")
     builder.button(text="✏️ Сменить фамилию", callback_data="change_name")
     if is_admin:
@@ -355,6 +376,67 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>\n\n(Попроси админа обновить расписание).", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
     await callback.answer()
+
+# --- ШТРАФЫ И ДОКИДЫ ---
+@dp.callback_query(F.data == "add_fine")
+async def btn_add_fine(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔻 <b>Оформление штрафа</b>\n\nВведи сумму штрафа (только число, например: <code>3000</code>):", parse_mode="HTML")
+    await state.set_state(TransactionState.waiting_for_fine)
+    await callback.answer()
+
+@dp.message(TransactionState.waiting_for_fine)
+async def process_fine(message: types.Message, state: FSMContext):
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Ошибка! Введи положительное число (без букв, минусов и пробелов).")
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    await add_transaction(message.from_user.id, "fine", amount, today_str)
+    
+    is_admin = message.from_user.id in ADMIN_IDS
+    # КРАСИВОЕ СООБЩЕНИЕ ОБ УСПЕХЕ
+    await message.answer(
+        f"✅ <b>Штраф успешно применен!</b>\n\n"
+        f"Из вашей зарплаты вычтено: <b>{amount} ₽</b>.\n"
+        f"Эта сумма автоматически уменьшит итоговый расчет при следующей выплате.", 
+        reply_markup=get_main_menu(is_admin), 
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+@dp.callback_query(F.data == "add_bonus")
+async def btn_add_bonus(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔺 <b>Оформление докида</b>\n\nВведи сумму докида (только число, например: <code>1000</code>):", parse_mode="HTML")
+    await state.set_state(TransactionState.waiting_for_bonus)
+    await callback.answer()
+
+@dp.message(TransactionState.waiting_for_bonus)
+async def process_bonus(message: types.Message, state: FSMContext):
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Ошибка! Введи положительное число (без букв, минусов и пробелов).")
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    await add_transaction(message.from_user.id, "bonus", amount, today_str)
+    
+    is_admin = message.from_user.id in ADMIN_IDS
+    # КРАСИВОЕ СООБЩЕНИЕ ОБ УСПЕХЕ
+    await message.answer(
+        f"✅ <b>Докид успешно добавлен!</b>\n\n"
+        f"К вашей зарплате прибавлено: <b>{amount} ₽</b>.\n"
+        f"Эта сумма автоматически увеличит итоговый расчет при следующей выплате.", 
+        reply_markup=get_main_menu(is_admin), 
+        parse_mode="HTML"
+    )
+    await state.clear()
 
 # --- СМЕНА СТАВКИ И ФАМИЛИИ ---
 @dp.callback_query(F.data == "change_rate")
@@ -450,6 +532,7 @@ async def btn_salary(callback: types.CallbackQuery):
         end_date = today.replace(day=10)
 
     start_str, end_str = start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+    end_inclusive_str = (end_date - timedelta(days=1)).strftime("%Y-%m-%d") 
 
     async with aiosqlite.connect("king_tabak.db") as db:
         async with db.execute("SELECT COUNT(*) FROM shifts WHERE user_id = ? AND date >= ? AND date < ?", (callback.from_user.id, start_str, end_str)) as cursor:
@@ -458,8 +541,27 @@ async def btn_salary(callback: types.CallbackQuery):
     try: rate = int(role)
     except: rate = 0
         
-    total = count * rate
-    text = (f"💰 <b>Расчет зарплаты:</b>\n\nПериод: с {start_date.strftime('%d.%m')} по {(end_date - timedelta(days=1)).strftime('%d.%m')}\nВыплата: <b>{end_date.strftime('%d.%m.%Y')}</b>\nТвоя ставка: <b>{rate} ₽</b>\nОтработано смен: {count}\n\n<b>К выплате: {total} ₽</b>")
+    base_salary = count * rate
+
+    total_fines = await get_transactions_sum(callback.from_user.id, start_str, end_inclusive_str, "fine")
+    total_bonuses = await get_transactions_sum(callback.from_user.id, start_str, end_inclusive_str, "bonus")
+
+    final_salary = base_salary - total_fines + total_bonuses
+
+    # КРАСИВЫЙ ВЫВОД
+    text = (
+        f"💳 <b>Расчетный лист</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🗓 Период: {start_date.strftime('%d.%m')} — {(end_date - timedelta(days=1)).strftime('%d.%m')}\n"
+        f"💸 Дата выплаты: <b>{end_date.strftime('%d.%m.%Y')}</b>\n\n"
+        f"🕒 Отработано смен: <b>{count}</b>\n"
+        f"💵 Твоя ставка: <b>{rate} ₽</b>\n"
+        f"⚙️ Оклад за смены: <b>{base_salary} ₽</b>\n\n"
+        f"🔻 Вычтено (штрафы): <b>-{total_fines} ₽</b>\n"
+        f"🔺 Начислено (докиды): <b>+{total_bonuses} ₽</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>К ВЫПЛАТЕ: {final_salary} ₽</b>"
+    )
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
@@ -490,13 +592,11 @@ async def btn_toggle_auto(callback: types.CallbackQuery, state: FSMContext):
     
     auto_month = await get_setting("sync_month")
     if auto_month:
-        # Выключаем
         await set_setting("sync_month", "")
         await set_setting("sync_year", "")
         await callback.message.answer("❌ Автосинхронизация выключена.")
     else:
-        # Включаем
-        await callback.message.answer("Введи месяц и год для автосинхронизации (например: <b>10 2026</b>):\n\nБот будет проверять таблицу каждые 2 часа и обновлять смены, если админ что-то поменяет.", parse_mode="HTML")
+        await callback.message.answer("Введи месяц и год для автосинхронизации (например: <b>10 2026</b>):", parse_mode="HTML")
         await state.set_state(AutoSyncState.waiting_for_sync_date)
     await callback.answer()
 
@@ -508,9 +608,7 @@ async def process_toggle_auto_date(message: types.Message, state: FSMContext):
         await set_setting("sync_month", str(month))
         await set_setting("sync_year", str(year))
         
-        # Запускаем первую проверку сразу
         success, msg = await process_and_save_sheet(month, year, is_auto=False)
-        
         await message.answer(f"✅ Автосинхронизация включена на {month:02d}.{year}!\n\nПервичная загрузка: {msg}")
     except ValueError:
         await message.answer("❌ Неверный формат. Напиши месяц и год через пробел (например, 10 2026).")
@@ -523,7 +621,6 @@ async def btn_back_to_main(callback: types.CallbackQuery):
     await callback.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
     await callback.answer()
 
-# --- РУЧНОЕ ДОБАВЛЕНИЕ/УДАЛЕНИЕ ---
 @dp.callback_query(F.data == "delete_shift")
 async def btn_delete_shift(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -620,7 +717,6 @@ async def process_shift_replaced_by(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Такая смена уже есть!", reply_markup=get_main_menu(True))
     await state.clear()
 
-# --- РУЧНОЙ ИМПОРТ ---
 @dp.callback_query(F.data == "import_gsheet")
 async def btn_import_gsheet(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -645,7 +741,6 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
 # --- ЗАПУСК ---
 async def main():
     await init_db()
-    # Запускаем фоновый воркер автосинхронизации
     asyncio.create_task(auto_sync_worker())
     
     print("Бот запущен...", flush=True)
