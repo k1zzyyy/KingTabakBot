@@ -327,7 +327,7 @@ async def auto_sync_worker():
 
 # --- КЛАВИАТУРЫ ---
 def get_reply_menu():
-    # Создаем нижнюю панель с одной кнопкой
+    # Нижняя панель с кнопкой
     kb = [[KeyboardButton(text="Меню")]]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, is_persistent=True)
 
@@ -358,22 +358,25 @@ def get_admin_inline_menu(auto_status):
 # --- ОБРАБОТЧИКИ: МЕНЮ И СТАРТ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear() # Сбрасываем состояния, если они были
+    await state.clear()
     user = await get_user(message.from_user.id)
     if user:
         name, role = user
         is_admin = message.from_user.id in ADMIN_IDS
         try: rate_val = int(role)
         except: rate_val = 0
-        await message.answer(f"Привет!\nТвоя ставка: <b>{rate_val} ₽</b>.\nВыбери действие:", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+        
+        # Сначала отправляем клавиатуру снизу
+        await message.answer(f"Привет!\nТвоя ставка: <b>{rate_val} ₽</b>.", reply_markup=get_reply_menu(), parse_mode="HTML")
+        # Потом инлайн-меню
+        await message.answer("Выбери действие:", reply_markup=get_main_menu(is_admin))
     else:
-        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", parse_mode="HTML")
+        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", reply_markup=get_reply_menu(), parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
 
-# Обработчик нижней кнопки "Меню"
 @dp.message(F.text == "Меню")
 async def cmd_menu_button(message: types.Message, state: FSMContext):
-    await state.clear() # Принудительно сбрасываем ввод, если он был
+    await state.clear()
     user = await get_user(message.from_user.id)
     if user:
         name, role = user
@@ -382,14 +385,13 @@ async def cmd_menu_button(message: types.Message, state: FSMContext):
         except: rate_val = 0
         await message.answer(f"Главное меню:\nТвоя ставка: <b>{rate_val} ₽</b>.", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     else:
-        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", parse_mode="HTML")
+        await message.answer("Напиши свою <b>Фамилию</b> для регистрации:", reply_markup=get_reply_menu(), parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
 
-# Скрытая команда /admin (только для админов)
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
-        return # Молча игнорируем для всех остальных
+        return
     await state.clear()
     
     auto_month = await get_setting("sync_month")
@@ -417,7 +419,8 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     await save_user(callback.from_user.id, name, role)
     
     is_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>\n\n(Попроси админа обновить расписание).", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+    await callback.message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>", reply_markup=get_reply_menu(), parse_mode="HTML")
+    await callback.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
     await state.clear()
     await callback.answer()
 
