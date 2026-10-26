@@ -293,7 +293,7 @@ async def process_and_save_sheet(month, year, is_auto=False):
 # --- ФОНОВАЯ АВТОСИНХРОНИЗАЦИЯ ---
 async def auto_sync_worker():
     while True:
-        await asyncio.sleep(3600 * 2) # Проверка каждые 2 часа
+        await asyncio.sleep(600) # Проверка каждые 600 секунд
         try:
             sync_month = await get_setting("sync_month")
             sync_year = await get_setting("sync_year")
