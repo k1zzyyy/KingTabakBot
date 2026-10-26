@@ -205,20 +205,16 @@ async def daily_reminder_worker():
         target_time = time(21, 45, 0)
         target_datetime = datetime.combine(now.date(), target_time, MOSCOW_TZ)
         
-        # Если время уже прошло сегодня, планируем на завтра
         if now >= target_datetime:
             target_datetime += timedelta(days=1)
             
-        # Спим до 21:45
         seconds_until_target = (target_datetime - now).total_seconds()
         await asyncio.sleep(seconds_until_target)
         
-        # Наступило 21:45! Делаем рассылку.
         try:
             today_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
             
             async with aiosqlite.connect("king_tabak.db") as db:
-                # Ищем всех, у кого сегодня ДНЕВНАЯ смена
                 query = """
                     SELECT DISTINCT user_id FROM shifts 
                     WHERE date = ? AND (shift_type LIKE '%День%' OR shift_type = 'Дневная')
@@ -233,18 +229,17 @@ async def daily_reminder_worker():
                         "⏰ <b>Напоминание!</b>\n\nКоллеги, не забудьте закрыть смену ровно в 22:00!", 
                         parse_mode="HTML"
                     )
-                    await asyncio.sleep(0.1) # Защита от флуда Telegram
+                    await asyncio.sleep(0.1)
                 except Exception:
-                    pass # Если сотрудник заблокировал бота
+                    pass
                     
         except Exception as e:
             print(f"[НАПОМИНАНИЕ] Ошибка: {e}")
             
-        # Ждем еще минуту, чтобы цикл не сработал дважды в одну и ту же минуту
         await asyncio.sleep(60)
 
-# --- ПАРСИНГ ТАБЛИЦЫ ---
-async def process_and_save_sheet(month, year, is_auto=False):
+# --- ПАРСИНГ ТАБЛИЦЫ (С ТИХИМ РЕЖИМОМ) ---
+async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
     try:
         async with aiohttp.ClientSession() as session_http:
             async with session_http.get(SHEET_CSV_URL) as response:
@@ -364,11 +359,11 @@ async def process_and_save_sheet(month, year, is_auto=False):
                         notified_users.add(shifts[i]['user_id'])
 
         await set_setting("last_sheet_hash", current_hash)
-        
         await set_setting("last_loaded_month", str(month))
         await set_setting("last_loaded_year", str(year))
         
-        if notified_users:
+        # Если это не тихий режим, шлем уведомления всем
+        if notified_users and notify_users:
             for uid in notified_users:
                 try:
                     await bot.send_message(uid, "🔔 <b>Внимание!</b> Обновлено расписание смен.\nЗайди в бота и нажми «📅 Мои смены».", parse_mode="HTML")
@@ -376,7 +371,7 @@ async def process_and_save_sheet(month, year, is_auto=False):
                     pass
 
         result_msg = f"✅ Импорт завершен!\nДобавлено смен: {success_count}."
-        if missing_names:
+        if missing_names and notify_users: # Ошибки показываем только админу при ручной загрузке
             missing_list = list(missing_names)
             result_text = f"\n⚠️ Этих людей нет в базе (всего {len(missing_list)} чел.):\n{', '.join(missing_list[:10])}..."
             result_msg += result_text
@@ -482,7 +477,7 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     
     await message.answer(f"⚙️ Админ-панель:\nАвтосинхронизация: <b>{auto_status}</b>", reply_markup=get_admin_inline_menu(auto_status), parse_mode="HTML")
 
-# --- РЕГИСТРАЦИЯ ---
+# --- РЕГИСТРАЦИЯ С АВТО-ПОДГРУЗКОЙ СМЕН ---
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
@@ -501,11 +496,21 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     await save_user(callback.from_user.id, name, role)
     
     is_admin = callback.from_user.id in ADMIN_IDS
-    
     sched_info = await get_schedule_text()
     
+    # 🪄 МАГИЯ: ТИХАЯ ПОДГРУЗКА СМЕН ДЛЯ НОВИЧКА
+    last_month = await get_setting("last_loaded_month")
+    last_year = await get_setting("last_loaded_year")
+    
+    load_msg = ""
+    if last_month and last_year:
+        load_msg = "\n\n⏳ Подгружаю твои смены из таблицы..."
+        await callback.message.answer(load_msg)
+        # Запускаем парсер в тихом режиме (notify_users=False)
+        await process_and_save_sheet(int(last_month), int(last_year), is_auto=False, notify_users=False)
+    
     await callback.message.answer(
-        f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>\nЗагружено расписание на: <b>{sched_info}</b>", 
+        f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>\nЗагружено расписание на: <b>{sched_info}</b>\n\nЕсли твоих смен нет в «Моих сменах» — значит, админ еще не добавил тебя в таблицу.", 
         reply_markup=get_reply_menu(), 
         parse_mode="HTML"
     )
@@ -842,7 +847,7 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
         return
 
     await message.answer("⏳ Скачиваю и обновляю данные...")
-    success, result_msg = await process_and_save_sheet(month, year, is_auto=False)
+    success, result_msg = await process_and_save_sheet(month, year, is_auto=False, notify_users=True)
     await message.answer(result_msg)
     await state.clear()
 
@@ -850,7 +855,7 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
 async def main():
     await init_db()
     asyncio.create_task(auto_sync_worker())
-    asyncio.create_task(daily_reminder_worker()) # Запуск напоминалки в 21:45
+    asyncio.create_task(daily_reminder_worker()) 
     
     print("Бот запущен...", flush=True)
     await dp.start_polling(bot)
