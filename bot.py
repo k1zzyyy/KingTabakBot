@@ -5,7 +5,8 @@ import csv
 import io
 import aiohttp
 import hashlib
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -22,6 +23,9 @@ ADMIN_IDS = [7088621971] # ID Захара
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# --- ЧАСОВОЙ ПОЯС ---
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # --- СЛОВАРЬ МЕСЯЦЕВ ---
 MONTHS_RU = {
@@ -91,7 +95,6 @@ async def set_setting(key, value):
         await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
         await db.commit()
 
-# --- ФУНКЦИЯ ПОЛУЧЕНИЯ ТЕКСТА О РАСПИСАНИИ ---
 async def get_schedule_text():
     last_month = await get_setting("last_loaded_month")
     last_year = await get_setting("last_loaded_year")
@@ -194,6 +197,51 @@ async def get_transactions_sum(user_id, start_date, end_date, t_type):
         ) as cursor:
             result = await cursor.fetchone()
             return result[0] if result[0] else 0
+
+# --- ФОНОВЫЙ ВОРКЕР НАПОМИНАНИЙ (21:45) ---
+async def daily_reminder_worker():
+    while True:
+        now = datetime.now(MOSCOW_TZ)
+        target_time = time(21, 45, 0)
+        target_datetime = datetime.combine(now.date(), target_time, MOSCOW_TZ)
+        
+        # Если время уже прошло сегодня, планируем на завтра
+        if now >= target_datetime:
+            target_datetime += timedelta(days=1)
+            
+        # Спим до 21:45
+        seconds_until_target = (target_datetime - now).total_seconds()
+        await asyncio.sleep(seconds_until_target)
+        
+        # Наступило 21:45! Делаем рассылку.
+        try:
+            today_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+            
+            async with aiosqlite.connect("king_tabak.db") as db:
+                # Ищем всех, у кого сегодня ДНЕВНАЯ смена
+                query = """
+                    SELECT DISTINCT user_id FROM shifts 
+                    WHERE date = ? AND (shift_type LIKE '%День%' OR shift_type = 'Дневная')
+                """
+                async with db.execute(query, (today_str,)) as cursor:
+                    users_to_notify = await cursor.fetchall()
+                    
+            for (uid,) in users_to_notify:
+                try:
+                    await bot.send_message(
+                        uid, 
+                        "⏰ <b>Напоминание!</b>\n\nКоллеги, не забудьте закрыть смену ровно в 22:00!", 
+                        parse_mode="HTML"
+                    )
+                    await asyncio.sleep(0.1) # Защита от флуда Telegram
+                except Exception:
+                    pass # Если сотрудник заблокировал бота
+                    
+        except Exception as e:
+            print(f"[НАПОМИНАНИЕ] Ошибка: {e}")
+            
+        # Ждем еще минуту, чтобы цикл не сработал дважды в одну и ту же минуту
+        await asyncio.sleep(60)
 
 # --- ПАРСИНГ ТАБЛИЦЫ ---
 async def process_and_save_sheet(month, year, is_auto=False):
@@ -317,7 +365,6 @@ async def process_and_save_sheet(month, year, is_auto=False):
 
         await set_setting("last_sheet_hash", current_hash)
         
-        # СОХРАНЯЕМ ИНФОРМАЦИЮ О ЗАГРУЖЕННОМ МЕСЯЦЕ
         await set_setting("last_loaded_month", str(month))
         await set_setting("last_loaded_year", str(year))
         
@@ -803,6 +850,7 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
 async def main():
     await init_db()
     asyncio.create_task(auto_sync_worker())
+    asyncio.create_task(daily_reminder_worker()) # Запуск напоминалки в 21:45
     
     print("Бот запущен...", flush=True)
     await dp.start_polling(bot)
