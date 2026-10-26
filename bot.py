@@ -23,6 +23,13 @@ ADMIN_IDS = [7088621971] # ID Захара
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# --- СЛОВАРЬ МЕСЯЦЕВ ---
+MONTHS_RU = {
+    1: "январь", 2: "февраль", 3: "март", 4: "апрель",
+    5: "май", 6: "июнь", 7: "июль", 8: "август",
+    9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"
+}
+
 # --- СОСТОЯНИЯ ---
 class RegState(StatesGroup):
     waiting_for_name = State()
@@ -83,6 +90,20 @@ async def set_setting(key, value):
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
         await db.commit()
+
+# --- ФУНКЦИЯ ПОЛУЧЕНИЯ ТЕКСТА О РАСПИСАНИИ ---
+async def get_schedule_text():
+    last_month = await get_setting("last_loaded_month")
+    last_year = await get_setting("last_loaded_year")
+    
+    if last_month and last_year:
+        try:
+            month_int = int(last_month)
+            month_name = MONTHS_RU.get(month_int, last_month)
+            return f"{month_name} {last_year}"
+        except ValueError:
+            return "неизвестно"
+    return "пока не загружено"
 
 async def get_user(telegram_id):
     async with aiosqlite.connect("king_tabak.db") as db:
@@ -296,6 +317,10 @@ async def process_and_save_sheet(month, year, is_auto=False):
 
         await set_setting("last_sheet_hash", current_hash)
         
+        # СОХРАНЯЕМ ИНФОРМАЦИЮ О ЗАГРУЖЕННОМ МЕСЯЦЕ
+        await set_setting("last_loaded_month", str(month))
+        await set_setting("last_loaded_year", str(year))
+        
         if notified_users:
             for uid in notified_users:
                 try:
@@ -327,7 +352,6 @@ async def auto_sync_worker():
 
 # --- КЛАВИАТУРЫ ---
 def get_reply_menu():
-    # Нижняя панель с кнопкой
     kb = [[KeyboardButton(text="Меню")]]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, is_persistent=True)
 
@@ -366,9 +390,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
         try: rate_val = int(role)
         except: rate_val = 0
         
-        # Сначала отправляем клавиатуру снизу
-        await message.answer(f"Привет!\nТвоя ставка: <b>{rate_val} ₽</b>.", reply_markup=get_reply_menu(), parse_mode="HTML")
-        # Потом инлайн-меню
+        sched_info = await get_schedule_text()
+        
+        await message.answer(
+            f"Привет!\nЗагружено расписание на: <b>{sched_info}</b>\nТвоя ставка: <b>{rate_val} ₽</b>.", 
+            reply_markup=get_reply_menu(), 
+            parse_mode="HTML"
+        )
         await message.answer("Выбери действие:", reply_markup=get_main_menu(is_admin))
     else:
         await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", reply_markup=get_reply_menu(), parse_mode="HTML")
@@ -383,7 +411,14 @@ async def cmd_menu_button(message: types.Message, state: FSMContext):
         is_admin = message.from_user.id in ADMIN_IDS
         try: rate_val = int(role)
         except: rate_val = 0
-        await message.answer(f"Главное меню:\nТвоя ставка: <b>{rate_val} ₽</b>.", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+        
+        sched_info = await get_schedule_text()
+        
+        await message.answer(
+            f"Главное меню:\nЗагружено расписание на: <b>{sched_info}</b>\nТвоя ставка: <b>{rate_val} ₽</b>", 
+            reply_markup=get_main_menu(is_admin), 
+            parse_mode="HTML"
+        )
     else:
         await message.answer("Напиши свою <b>Фамилию</b> для регистрации:", reply_markup=get_reply_menu(), parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
@@ -419,7 +454,14 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     await save_user(callback.from_user.id, name, role)
     
     is_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>", reply_markup=get_reply_menu(), parse_mode="HTML")
+    
+    sched_info = await get_schedule_text()
+    
+    await callback.message.answer(
+        f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>\nЗагружено расписание на: <b>{sched_info}</b>", 
+        reply_markup=get_reply_menu(), 
+        parse_mode="HTML"
+    )
     await callback.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
     await state.clear()
     await callback.answer()
