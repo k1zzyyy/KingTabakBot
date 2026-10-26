@@ -13,6 +13,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -189,7 +190,7 @@ async def process_and_save_sheet(month, year, is_auto=False):
         last_hash = await get_setting("last_sheet_hash")
         
         if last_hash == current_hash and is_auto:
-            return True, "Данные не изменились, синхронизация не требуется."
+            return True, "Данные не изменились."
 
         f = io.StringIO(text)
         delimiter = ','
@@ -324,7 +325,12 @@ async def auto_sync_worker():
         except Exception:
             pass
 
-# --- МЕНЮ ---
+# --- КЛАВИАТУРЫ ---
+def get_reply_menu():
+    # Создаем нижнюю панель с одной кнопкой
+    kb = [[KeyboardButton(text="Меню")]]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, is_persistent=True)
+
 def get_main_menu(is_admin=False):
     builder = InlineKeyboardBuilder()
     builder.button(text="📅 Мои смены", callback_data="my_shifts")
@@ -339,22 +345,60 @@ def get_main_menu(is_admin=False):
     builder.adjust(1)
     return builder.as_markup()
 
-# --- СТАРТ И РЕГИСТРАЦИЯ ---
+def get_admin_inline_menu(auto_status):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить смену", callback_data="add_shift")
+    builder.button(text="❌ Удалить смену", callback_data="delete_shift")
+    builder.button(text="⚡ Авто-синхронизация", callback_data="toggle_auto")
+    builder.button(text="🔄 Загрузить вручную", callback_data="import_gsheet")
+    builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# --- ОБРАБОТЧИКИ: МЕНЮ И СТАРТ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear() # Сбрасываем состояния, если они были
     user = await get_user(message.from_user.id)
     if user:
         name, role = user
         is_admin = message.from_user.id in ADMIN_IDS
-        try:
-            rate_val = int(role)
-        except (ValueError, TypeError):
-            rate_val = 0
+        try: rate_val = int(role)
+        except: rate_val = 0
         await message.answer(f"Привет!\nТвоя ставка: <b>{rate_val} ₽</b>.\nВыбери действие:", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     else:
         await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
 
+# Обработчик нижней кнопки "Меню"
+@dp.message(F.text == "Меню")
+async def cmd_menu_button(message: types.Message, state: FSMContext):
+    await state.clear() # Принудительно сбрасываем ввод, если он был
+    user = await get_user(message.from_user.id)
+    if user:
+        name, role = user
+        is_admin = message.from_user.id in ADMIN_IDS
+        try: rate_val = int(role)
+        except: rate_val = 0
+        await message.answer(f"Главное меню:\nТвоя ставка: <b>{rate_val} ₽</b>.", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
+    else:
+        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", parse_mode="HTML")
+        await state.set_state(RegState.waiting_for_name)
+
+# Скрытая команда /admin (только для админов)
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return # Молча игнорируем для всех остальных
+    await state.clear()
+    
+    auto_month = await get_setting("sync_month")
+    auto_year = await get_setting("sync_year")
+    auto_status = f"Вкл ({auto_month}.{auto_year})" if auto_month else "Выкл"
+    
+    await message.answer(f"⚙️ Админ-панель:\nАвтосинхронизация: <b>{auto_status}</b>", reply_markup=get_admin_inline_menu(auto_status), parse_mode="HTML")
+
+# --- РЕГИСТРАЦИЯ ---
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
@@ -388,24 +432,16 @@ async def btn_add_fine(callback: types.CallbackQuery, state: FSMContext):
 async def process_fine(message: types.Message, state: FSMContext):
     try:
         amount = int(message.text.strip())
-        if amount <= 0:
-            raise ValueError
+        if amount <= 0: raise ValueError
     except ValueError:
-        await message.answer("❌ Ошибка! Введи положительное число (без букв, минусов и пробелов).")
+        await message.answer("❌ Ошибка! Введи положительное число.")
         return
 
     today_str = date.today().strftime("%Y-%m-%d")
     await add_transaction(message.from_user.id, "fine", amount, today_str)
     
     is_admin = message.from_user.id in ADMIN_IDS
-    # КРАСИВОЕ СООБЩЕНИЕ ОБ УСПЕХЕ
-    await message.answer(
-        f"✅ <b>Штраф успешно применен!</b>\n\n"
-        f"Из вашей зарплаты вычтено: <b>{amount} ₽</b>.\n"
-        f"Эта сумма автоматически уменьшит итоговый расчет при следующей выплате.", 
-        reply_markup=get_main_menu(is_admin), 
-        parse_mode="HTML"
-    )
+    await message.answer(f"✅ <b>Штраф успешно применен!</b>\n\nИз вашей зарплаты вычтено: <b>{amount} ₽</b>.", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "add_bonus")
@@ -418,24 +454,16 @@ async def btn_add_bonus(callback: types.CallbackQuery, state: FSMContext):
 async def process_bonus(message: types.Message, state: FSMContext):
     try:
         amount = int(message.text.strip())
-        if amount <= 0:
-            raise ValueError
+        if amount <= 0: raise ValueError
     except ValueError:
-        await message.answer("❌ Ошибка! Введи положительное число (без букв, минусов и пробелов).")
+        await message.answer("❌ Ошибка! Введи положительное число.")
         return
 
     today_str = date.today().strftime("%Y-%m-%d")
     await add_transaction(message.from_user.id, "bonus", amount, today_str)
     
     is_admin = message.from_user.id in ADMIN_IDS
-    # КРАСИВОЕ СООБЩЕНИЕ ОБ УСПЕХЕ
-    await message.answer(
-        f"✅ <b>Докид успешно добавлен!</b>\n\n"
-        f"К вашей зарплате прибавлено: <b>{amount} ₽</b>.\n"
-        f"Эта сумма автоматически увеличит итоговый расчет при следующей выплате.", 
-        reply_markup=get_main_menu(is_admin), 
-        parse_mode="HTML"
-    )
+    await message.answer(f"✅ <b>Докид успешно добавлен!</b>\n\nК вашей зарплате прибавлено: <b>{amount} ₽</b>.", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
 
 # --- СМЕНА СТАВКИ И ФАМИЛИИ ---
@@ -445,7 +473,6 @@ async def btn_change_rate(callback: types.CallbackQuery):
     if not user: return
     name, role = user
     builder = InlineKeyboardBuilder()
-
     if role not in ("2800", "3100", "3500"):
         builder.button(text="Ставка 2800 ₽", callback_data="rate_2800")
         builder.button(text="Ставка 3100 ₽", callback_data="rate_3100")
@@ -462,7 +489,6 @@ async def btn_change_rate(callback: types.CallbackQuery):
         elif role == "3500":
             builder.button(text="⬇️ Понизить до 3100 ₽", callback_data="rate_3100")
             msg_text = "Твоя текущая ставка: <b>3500 ₽</b>.\nХочешь понизить?"
-    
     builder.button(text="🔙 Отмена", callback_data="back_to_main")
     builder.adjust(1)
     await callback.message.answer(msg_text, reply_markup=builder.as_markup(), parse_mode="HTML")
@@ -542,13 +568,10 @@ async def btn_salary(callback: types.CallbackQuery):
     except: rate = 0
         
     base_salary = count * rate
-
     total_fines = await get_transactions_sum(callback.from_user.id, start_str, end_inclusive_str, "fine")
     total_bonuses = await get_transactions_sum(callback.from_user.id, start_str, end_inclusive_str, "bonus")
-
     final_salary = base_salary - total_fines + total_bonuses
 
-    # КРАСИВЫЙ ВЫВОД
     text = (
         f"💳 <b>Расчетный лист</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -565,7 +588,7 @@ async def btn_salary(callback: types.CallbackQuery):
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
-# --- АДМИН ПАНЕЛЬ ---
+# --- АДМИН ПАНЕЛЬ (INLINE) ---
 @dp.callback_query(F.data == "admin_panel")
 async def btn_admin_panel(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -575,15 +598,7 @@ async def btn_admin_panel(callback: types.CallbackQuery):
     auto_month = await get_setting("sync_month")
     auto_year = await get_setting("sync_year")
     auto_status = f"Вкл ({auto_month}.{auto_year})" if auto_month else "Выкл"
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить смену", callback_data="add_shift")
-    builder.button(text="❌ Удалить смену", callback_data="delete_shift")
-    builder.button(text="⚡ Авто-синхронизация", callback_data="toggle_auto")
-    builder.button(text=f"🔄 Загрузить вручную", callback_data="import_gsheet")
-    builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
-    builder.adjust(1)
-    await callback.message.answer(f"⚙️ Админ-панель:\nАвтосинхронизация: <b>{auto_status}</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.message.answer(f"⚙️ Админ-панель:\nАвтосинхронизация: <b>{auto_status}</b>", reply_markup=get_admin_inline_menu(auto_status), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "toggle_auto")
@@ -621,6 +636,7 @@ async def btn_back_to_main(callback: types.CallbackQuery):
     await callback.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
     await callback.answer()
 
+# --- АДМИН: УДАЛЕНИЕ / ДОБАВЛЕНИЕ / ИМПОРТ ---
 @dp.callback_query(F.data == "delete_shift")
 async def btn_delete_shift(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
