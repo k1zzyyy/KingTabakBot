@@ -528,7 +528,7 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
             await message.answer(f"❌ Не удалось найти даты. Вот строка заголовка:\n<code>{day_headers}</code>", parse_mode="HTML")
             return
 
-        # 1. СОБИРАЕМ ВСЕ СМЕНЫ В ОДИН СПИСОК (в память)
+        # 1. СОБИРАЕМ ВСЕ СМЕНЫ В ОДИН СПИСОК (включая незарегистрированных!)
         parsed_shifts = []
         missing_names = set() 
         current_address = ""
@@ -551,21 +551,21 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
                 if cell_value and cell_value not in ("---", "——", "—", "⬆️", "⬇️", "↑", "↓"):
                     
                     user = await get_user_by_name(cell_value)
-                    if user:
-                        user_id = user[0]
-                        try:
-                            shift_date = datetime(year, month, day_num).strftime("%Y-%m-%d")
-                            parsed_shifts.append({
-                                'user_id': user_id,
-                                'name': cell_value,
-                                'date': shift_date,
-                                'shift_type': shift_type,
-                                'address': current_address
-                            })
-                        except Exception:
-                            pass
-                    else:
+                    user_id = user[0] if user else None
+                    if not user:
                         missing_names.add(cell_value)
+                        
+                    try:
+                        shift_date = datetime(year, month, day_num).strftime("%Y-%m-%d")
+                        parsed_shifts.append({
+                            'user_id': user_id,
+                            'name': cell_value,
+                            'date': shift_date,
+                            'shift_type': shift_type,
+                            'address': current_address
+                        })
+                    except Exception:
+                        pass
 
         # 2. ГРУППИРУЕМ И СОРТИРУЕМ ПО АДРЕСАМ
         locations = defaultdict(list)
@@ -585,22 +585,24 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
             shifts.sort(key=sort_key) # Сортируем цепочку
             
             for i in range(len(shifts)):
-                # Кого сменяет - берем предыдущего в цепочке
+                # Кого сменяет - берем предыдущего в цепочке (даже если он не зареган)
                 replaces_name = shifts[i-1]['name'] if i > 0 else "-"
-                # Кто сменяет - берем следующего в цепочке
+                # Кто сменяет - берем следующего в цепочке (даже если он не зареган)
                 replaced_by_name = shifts[i+1]['name'] if i < len(shifts) - 1 else "-"
                 
-                added = await add_shift_to_db(
-                    shifts[i]['user_id'], 
-                    shifts[i]['date'], 
-                    shifts[i]['shift_type'], 
-                    shifts[i]['address'], 
-                    replaces_name, 
-                    replaced_by_name
-                )
-                if added:
-                    success_count += 1
-                    notified_users.add(shifts[i]['user_id'])
+                # Сохраняем в базу ТОЛЬКО если юзер зарегистрирован
+                if shifts[i]['user_id'] is not None:
+                    added = await add_shift_to_db(
+                        shifts[i]['user_id'], 
+                        shifts[i]['date'], 
+                        shifts[i]['shift_type'], 
+                        shifts[i]['address'], 
+                        replaces_name, 
+                        replaced_by_name
+                    )
+                    if added:
+                        success_count += 1
+                        notified_users.add(shifts[i]['user_id'])
 
         # Вывод результата
         result_msg = f"✅ Импорт завершен!\nДобавлено новых смен: {success_count}."
