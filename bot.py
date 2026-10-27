@@ -139,36 +139,36 @@ async def get_all_users():
         async with db.execute("SELECT telegram_id, name, role FROM users") as cursor:
             return await cursor.fetchall()
 
-async def check_shift_exists(user_id, date_str, shift_type):
+# --- ОПТИМИЗИРОВАННАЯ ФУНКЦИЯ ПОИСКА БЛИЖАЙШЕЙ СМЕНЫ ---
+async def get_next_shift(user_id):
+    now = datetime.now(MOSCOW_TZ)
+    today_str = now.strftime("%Y-%m-%d")
+    
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT id FROM shifts WHERE user_id = ? AND date = ? AND shift_type = ?", (user_id, date_str, shift_type)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def add_shift_to_db(user_id, date_str, shift_type, address, replaces, replaced_by):
-    if await check_shift_exists(user_id, date_str, shift_type):
-        return False 
+        # Берем все смены, начиная с сегодняшней даты
+        async with db.execute(
+            "SELECT date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? AND date >= ? ORDER BY date ASC",
+            (user_id, today_str)
+        ) as cursor:
+            shifts = await cursor.fetchall()
+            
+    for s in shifts:
+        s_date, s_type, addr, repl, repl_by = s
         
-    async with aiosqlite.connect("king_tabak.db") as db:
-        await db.execute(
-            "INSERT INTO shifts (user_id, date, shift_type, address, replaces, replaced_by) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, date_str, shift_type, address, replaces, replaced_by)
-        )
-        await db.commit()
-        return True
+        # Определяем время начала смены
+        start_hour = 10 if "День" in s_type else 22
+        s_dt = datetime.strptime(f"{s_date} {start_hour}:00:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=MOSCOW_TZ)
+        
+        # Если время начала смены еще не наступило (например, сейчас 15:00, а смена в 22:00) — это и есть ближайшая
+        if now < s_dt:
+            return s
+            
+    return None
 
 async def get_user_shifts(user_id):
     async with aiosqlite.connect("king_tabak.db") as db:
         async with db.execute("SELECT id, date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? ORDER BY date", (user_id,)) as cursor:
             return await cursor.fetchall()
-
-async def get_next_shift(user_id):
-    today_str = date.today().strftime("%Y-%m-%d")
-    async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute(
-            "SELECT date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? AND date >= ? ORDER BY date ASC LIMIT 1",
-            (user_id, today_str)
-        ) as cursor:
-            return await cursor.fetchone()
 
 async def delete_shift_by_id(shift_id):
     async with aiosqlite.connect("king_tabak.db") as db:
@@ -198,8 +198,9 @@ async def get_transactions_sum(user_id, start_date, end_date, t_type):
             result = await cursor.fetchone()
             return result[0] if result[0] else 0
 
-# --- ФОНОВЫЙ ВОРКЕР НАПОМИНАНИЙ (21:45) ---
-async def daily_reminder_worker():
+# --- ФОНОВЫЕ ВОРКЕРЫ (НАПОМИНАНИЯ) ---
+async def daily_closing_reminder_worker():
+    # Напоминание в 21:45 для дневных смен
     while True:
         now = datetime.now(MOSCOW_TZ)
         target_time = time(21, 45, 0)
@@ -213,7 +214,6 @@ async def daily_reminder_worker():
         
         try:
             today_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
-            
             async with aiosqlite.connect("king_tabak.db") as db:
                 query = """
                     SELECT DISTINCT user_id FROM shifts 
@@ -224,21 +224,50 @@ async def daily_reminder_worker():
                     
             for (uid,) in users_to_notify:
                 try:
-                    await bot.send_message(
-                        uid, 
-                        "⏰ <b>Напоминание!</b>\n\nКоллеги, не забудьте закрыть смену ровно в 22:00!", 
-                        parse_mode="HTML"
-                    )
+                    await bot.send_message(uid, "⏰ <b>Напоминание!</b>\n\nКоллеги, не забудьте закрыть смену ровно в 22:00!", parse_mode="HTML")
                     await asyncio.sleep(0.1)
-                except Exception:
-                    pass
-                    
+                except Exception: pass
         except Exception as e:
-            print(f"[НАПОМИНАНИЕ] Ошибка: {e}")
-            
+            print(f"[ЗАКРЫТИЕ] Ошибка: {e}")
         await asyncio.sleep(60)
 
-# --- ПАРСИНГ ТАБЛИЦЫ (С ТИХИМ РЕЖИМОМ) ---
+async def shift_reminders_worker():
+    # Напоминания: Дневникам в 16:00 накануне, Ночникам в 12:00 в день смены
+    last_day_rem = None
+    last_night_rem = None
+    
+    while True:
+        now = datetime.now(MOSCOW_TZ)
+        
+        # Дневники (16:00 накануне)
+        if now.hour == 16 and now.minute < 5 and last_day_rem != now.date():
+            last_day_rem = now.date()
+            tomorrow_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            async with aiosqlite.connect("king_tabak.db") as db:
+                async with db.execute("SELECT user_id, address FROM shifts WHERE date = ? AND (shift_type LIKE '%День%' OR shift_type = 'Дневная')", (tomorrow_str,)) as cursor:
+                    shifts = await cursor.fetchall()
+            for uid, addr in shifts:
+                try:
+                    await bot.send_message(uid, f"☀️ Привет! Завтра в 10:00 у тебя смена на точке <b>{addr}</b>", parse_mode="HTML")
+                    await asyncio.sleep(0.1)
+                except Exception: pass
+
+        # Ночники (12:00 в день смены)
+        if now.hour == 12 and now.minute < 5 and last_night_rem != now.date():
+            last_night_rem = now.date()
+            today_str = now.strftime("%Y-%m-%d")
+            async with aiosqlite.connect("king_tabak.db") as db:
+                async with db.execute("SELECT user_id, address FROM shifts WHERE date = ? AND (shift_type LIKE '%Ночь%' OR shift_type = 'Ночная')", (today_str,)) as cursor:
+                    shifts = await cursor.fetchall()
+            for uid, addr in shifts:
+                try:
+                    await bot.send_message(uid, f"🌙 Привет! Сегодня в 22:00 у тебя смена на точке <b>{addr}</b>", parse_mode="HTML")
+                    await asyncio.sleep(0.1)
+                except Exception: pass
+        
+        await asyncio.sleep(60)
+
+# --- ОПТИМИЗИРОВАННЫЙ ПАРСИНГ ТАБЛИЦЫ ---
 async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
     try:
         async with aiohttp.ClientSession() as session_http:
@@ -334,11 +363,13 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
             type_weight = 0 if "День" in s['shift_type'] else 1
             return (s['date'], type_weight)
 
-        success_count = 0
         notified_users = set()
-
+        
+        # 1. Очищаем старые смены за этот месяц
         await clear_shifts_for_month(month, year)
 
+        # 2. Собираем ВСЕ смены в один список для быстрой записи
+        insert_data = []
         for addr, shifts in locations.items():
             shifts.sort(key=sort_key) 
             for i in range(len(shifts)):
@@ -346,23 +377,31 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
                 replaced_by_name = shifts[i+1]['name'] if i < len(shifts) - 1 else "-"
                 
                 if shifts[i]['user_id'] is not None:
-                    added = await add_shift_to_db(
+                    insert_data.append((
                         shifts[i]['user_id'], 
                         shifts[i]['date'], 
                         shifts[i]['shift_type'], 
                         shifts[i]['address'], 
                         replaces_name, 
                         replaced_by_name
-                    )
-                    if added:
-                        success_count += 1
-                        notified_users.add(shifts[i]['user_id'])
+                    ))
+                    notified_users.add(shifts[i]['user_id'])
+
+        # 3. Записываем всё в базу ОДНИМ ЗАПРОСОМ (executemany)
+        success_count = 0
+        if insert_data:
+            async with aiosqlite.connect("king_tabak.db") as db:
+                await db.executemany(
+                    "INSERT INTO shifts (user_id, date, shift_type, address, replaces, replaced_by) VALUES (?, ?, ?, ?, ?, ?)",
+                    insert_data
+                )
+                await db.commit()
+            success_count = len(insert_data)
 
         await set_setting("last_sheet_hash", current_hash)
         await set_setting("last_loaded_month", str(month))
         await set_setting("last_loaded_year", str(year))
         
-        # Если это не тихий режим, шлем уведомления всем
         if notified_users and notify_users:
             for uid in notified_users:
                 try:
@@ -371,7 +410,7 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
                     pass
 
         result_msg = f"✅ Импорт завершен!\nДобавлено смен: {success_count}."
-        if missing_names and notify_users: # Ошибки показываем только админу при ручной загрузке
+        if missing_names and notify_users:
             missing_list = list(missing_names)
             result_text = f"\n⚠️ Этих людей нет в базе (всего {len(missing_list)} чел.):\n{', '.join(missing_list[:10])}..."
             result_msg += result_text
@@ -498,7 +537,6 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     is_admin = callback.from_user.id in ADMIN_IDS
     sched_info = await get_schedule_text()
     
-    # 🪄 МАГИЯ: ТИХАЯ ПОДГРУЗКА СМЕН ДЛЯ НОВИЧКА
     last_month = await get_setting("last_loaded_month")
     last_year = await get_setting("last_loaded_year")
     
@@ -506,7 +544,7 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     if last_month and last_year:
         load_msg = "\n\n⏳ Подгружаю твои смены из таблицы..."
         await callback.message.answer(load_msg)
-        # Запускаем парсер в тихом режиме (notify_users=False)
+        # Запускаем парсер в тихом режиме (notify_users=False). Теперь это займет 1 секунду!
         await process_and_save_sheet(int(last_month), int(last_year), is_auto=False, notify_users=False)
     
     await callback.message.answer(
@@ -823,11 +861,15 @@ async def process_shift_replaces(message: types.Message, state: FSMContext):
 async def process_shift_replaced_by(message: types.Message, state: FSMContext):
     await state.update_data(replaced_by=message.text)
     data = await state.get_data()
-    added = await add_shift_to_db(data['target_user_id'], data['date'], data['shift_type'], data['address'], data['replaces'], message.text)
-    if added:
-        await message.answer("✅ Смена добавлена!", reply_markup=get_main_menu(True))
-    else:
-        await message.answer("⚠️ Такая смена уже есть!", reply_markup=get_main_menu(True))
+    
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute(
+            "INSERT INTO shifts (user_id, date, shift_type, address, replaces, replaced_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (data['target_user_id'], data['date'], data['shift_type'], data['address'], data['replaces'], message.text)
+        )
+        await db.commit()
+        
+    await message.answer("✅ Смена добавлена!", reply_markup=get_main_menu(True))
     await state.clear()
 
 @dp.callback_query(F.data == "import_gsheet")
@@ -854,8 +896,10 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
 # --- ЗАПУСК ---
 async def main():
     await init_db()
+    # Запускаем все фоновые процессы
     asyncio.create_task(auto_sync_worker())
-    asyncio.create_task(daily_reminder_worker()) 
+    asyncio.create_task(daily_closing_reminder_worker())
+    asyncio.create_task(shift_reminders_worker())
     
     print("Бот запущен...", flush=True)
     await dp.start_polling(bot)
