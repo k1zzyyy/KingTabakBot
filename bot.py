@@ -13,7 +13,6 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 load_dotenv()
@@ -52,8 +51,12 @@ class ImportState(StatesGroup):
 class AutoSyncState(StatesGroup):
     waiting_for_sync_date = State()
 
+class DeleteUserState(StatesGroup):
+    waiting_for_name = State()
+
 class DeleteShiftState(StatesGroup):
-    waiting_for_user = State()
+    waiting_for_name = State()
+    waiting_for_month = State()
 
 class ChangeNameState(StatesGroup):
     waiting_for_new_name = State()
@@ -77,6 +80,7 @@ async def init_db():
             )
         """)
         await db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS valid_names (name TEXT PRIMARY KEY)")
         
         await db.execute("UPDATE users SET role = '2800' WHERE role LIKE '%LvL1%' OR role = 'стажер' OR role = 'Стажер'")
         await db.execute("UPDATE users SET role = '3100' WHERE role LIKE '%LvL2%' OR role = 'продавец' OR role = 'Продавец'")
@@ -132,6 +136,12 @@ async def update_user_role(telegram_id, new_role):
 async def update_user_name(telegram_id, new_name):
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("UPDATE users SET name = ? WHERE telegram_id = ?", (new_name, telegram_id))
+        await db.commit()
+
+async def delete_user_from_db(telegram_id):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+        await db.execute("DELETE FROM shifts WHERE user_id = ?", (telegram_id,))
         await db.commit()
 
 async def get_all_users():
@@ -196,7 +206,7 @@ async def get_transactions_sum(user_id, start_date, end_date, t_type):
             result = await cursor.fetchone()
             return result[0] if result[0] else 0
 
-# --- ФОНОВЫЕ ВОРКЕРЫ (НАПОМИНАНИЯ) ---
+# --- ФОНОВЫЕ ВОРКЕРЫ ---
 async def daily_closing_reminder_worker():
     while True:
         now = datetime.now(MOSCOW_TZ)
@@ -225,7 +235,7 @@ async def daily_closing_reminder_worker():
                     await asyncio.sleep(0.1)
                 except Exception: pass
         except Exception as e:
-            print(f"[ЗАКРЫТИЕ] Ошибка: {e}")
+            pass
         await asyncio.sleep(60)
 
 async def shift_reminders_worker():
@@ -235,7 +245,6 @@ async def shift_reminders_worker():
     while True:
         now = datetime.now(MOSCOW_TZ)
         
-        # Дневники (16:00 накануне)
         if now.hour == 16 and now.minute < 5 and last_day_rem != now.date():
             last_day_rem = now.date()
             tomorrow_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -248,7 +257,6 @@ async def shift_reminders_worker():
                     await asyncio.sleep(0.1)
                 except Exception: pass
 
-        # Ночники (12:00 в день смены)
         if now.hour == 12 and now.minute < 5 and last_night_rem != now.date():
             last_night_rem = now.date()
             today_str = now.strftime("%Y-%m-%d")
@@ -263,35 +271,30 @@ async def shift_reminders_worker():
         
         await asyncio.sleep(60)
 
-# --- ОПТИМИЗИРОВАННЫЙ ПАРСИНГ ТАБЛИЦЫ ---
+# --- ПАРСИНГ ТАБЛИЦЫ ---
 async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
     try:
         async with aiohttp.ClientSession() as session_http:
             async with session_http.get(SHEET_CSV_URL) as response:
                 if response.status != 200:
-                    return False, f"Ошибка скачивания. Google вернул код: {response.status}"
+                    return False, f"Ошибка скачивания: {response.status}"
                 text = await response.text()
         
         if "<html" in text.lower() or "<!doctype html" in text.lower():
-            return False, "Ошибка: По ссылке скачалась веб-страница."
+            return False, "Ошибка: По ссылке не CSV."
 
         current_hash = hashlib.md5(text.encode()).hexdigest()
         last_hash = await get_setting("last_sheet_hash")
-        
         if last_hash == current_hash and is_auto:
-            return True, "Данные не изменились."
+            return True, "Без изменений."
 
         f = io.StringIO(text)
-        delimiter = ','
-        first_line = text.split('\n')[0]
-        if first_line.count(';') > first_line.count(','):
-            delimiter = ';'
-
+        delimiter = ',' if text.split('\n')[0].count(',') > text.split('\n')[0].count(';') else ';'
         reader = csv.reader(f, delimiter=delimiter)
         rows = list(reader)
 
         if len(rows) < 2:
-            return False, "Таблица пустая или неверный формат."
+            return False, "Таблица пустая."
 
         header_row_index = -1
         for idx, row in enumerate(rows[:10]): 
@@ -301,83 +304,65 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
                 break
         
         if header_row_index == -1:
-            return False, "Не смог найти строку с днями недели (1ВТ, 2СР...)."
+            return False, "Нет заголовков с днями."
             
         day_headers = rows[header_row_index]
         col_to_day = {}
         for i, cell in enumerate(day_headers):
             digits = ''.join(filter(str.isdigit, str(cell)))
-            if digits:
-                col_to_day[i] = int(digits)
-
-        if not col_to_day:
-            return False, "Не удалось найти даты."
+            if digits: col_to_day[i] = int(digits)
 
         parsed_shifts = []
         missing_names = set() 
+        all_names_in_sheet = set()
         current_address = ""
         
         for row in rows[header_row_index + 1:]:
             if len(row) < 2: continue
-            
             address_cell = row[0].strip()
-            if address_cell:
-                current_address = address_cell
+            if address_cell: current_address = address_cell
             
             shift_type = row[1].strip().capitalize() if len(row) > 1 else ""
-            if shift_type not in ("День", "Дневная", "Ночь", "Ночная"):
-                continue 
+            if shift_type not in ("День", "Дневная", "Ночь", "Ночная"): continue 
 
             for col_idx, day_num in col_to_day.items():
                 if col_idx >= len(row): continue
-                
                 cell_value = row[col_idx].strip()
                 if cell_value and cell_value not in ("---", "——", "—", "⬆️", "⬇️", "↑", "↓"):
-                    
+                    all_names_in_sheet.add(cell_value)
                     user = await get_user_by_name(cell_value)
                     user_id = user[0] if user else None
-                    if not user:
-                        missing_names.add(cell_value)
-                        
+                    if not user: missing_names.add(cell_value)
                     try:
                         shift_date = datetime(year, month, day_num).strftime("%Y-%m-%d")
                         parsed_shifts.append({
-                            'user_id': user_id,
-                            'name': cell_value,
-                            'date': shift_date,
-                            'shift_type': shift_type,
-                            'address': current_address
+                            'user_id': user_id, 'name': cell_value, 'date': shift_date,
+                            'shift_type': shift_type, 'address': current_address
                         })
-                    except Exception:
-                        pass
+                    except Exception: pass
+
+        if all_names_in_sheet:
+            async with aiosqlite.connect("king_tabak.db") as db:
+                for name in all_names_in_sheet:
+                    await db.execute("INSERT OR IGNORE INTO valid_names (name) VALUES (?)", (name,))
+                await db.commit()
 
         locations = defaultdict(list)
-        for shift in parsed_shifts:
-            locations[shift['address']].append(shift)
-
-        def sort_key(s):
-            type_weight = 0 if "День" in s['shift_type'] else 1
-            return (s['date'], type_weight)
+        for shift in parsed_shifts: locations[shift['address']].append(shift)
 
         notified_users = set()
-        
         await clear_shifts_for_month(month, year)
 
         insert_data = []
         for addr, shifts in locations.items():
-            shifts.sort(key=sort_key) 
+            shifts.sort(key=lambda s: (s['date'], 0 if "День" in s['shift_type'] else 1)) 
             for i in range(len(shifts)):
                 replaces_name = shifts[i-1]['name'] if i > 0 else "-"
                 replaced_by_name = shifts[i+1]['name'] if i < len(shifts) - 1 else "-"
-                
                 if shifts[i]['user_id'] is not None:
                     insert_data.append((
-                        shifts[i]['user_id'], 
-                        shifts[i]['date'], 
-                        shifts[i]['shift_type'], 
-                        shifts[i]['address'], 
-                        replaces_name, 
-                        replaced_by_name
+                        shifts[i]['user_id'], shifts[i]['date'], shifts[i]['shift_type'],
+                        shifts[i]['address'], replaces_name, replaced_by_name
                     ))
                     notified_users.add(shifts[i]['user_id'])
 
@@ -397,21 +382,16 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
         
         if notified_users and notify_users:
             for uid in notified_users:
-                try:
-                    await bot.send_message(uid, "🔔 <b>Внимание!</b> Обновлено расписание смен.\nЗайди в бота и нажми «📅 Мои смены».", parse_mode="HTML")
-                except Exception:
-                    pass
+                try: await bot.send_message(uid, "🔔 <b>Внимание!</b> Обновлено расписание смен.", parse_mode="HTML")
+                except Exception: pass
 
         result_msg = f"✅ Импорт завершен!\nДобавлено смен: {success_count}."
         if missing_names and notify_users:
-            missing_list = list(missing_names)
-            result_text = f"\n⚠️ Этих людей нет в базе (всего {len(missing_list)} чел.):\n{', '.join(missing_list[:10])}..."
-            result_msg += result_text
-            
+            result_msg += f"\n⚠️ Нет в базе: {', '.join(list(missing_names)[:10])}..."
         return True, result_msg
 
     except Exception as e:
-        return False, f"Ошибка при чтении: {str(e)}"
+        return False, f"Ошибка: {str(e)}"
 
 async def auto_sync_worker():
     while True:
@@ -420,285 +400,172 @@ async def auto_sync_worker():
             sync_month = await get_setting("sync_month")
             sync_year = await get_setting("sync_year")
             if sync_month and sync_year:
-                success, msg = await process_and_save_sheet(int(sync_month), int(sync_year), is_auto=True)
-        except Exception:
-            pass
+                await process_and_save_sheet(int(sync_month), int(sync_year), is_auto=True)
+        except Exception: pass
 
-# --- КЛАВИАТУРЫ ---
-def get_reply_menu():
-    kb = [[KeyboardButton(text="Меню")]]
+# --- КЛАВИАТУРЫ (ТОЛЬКО REPLY) ---
+def get_main_menu():
+    kb = [
+        [KeyboardButton(text="📅 Мои смены"), KeyboardButton(text="⏰ Ближайшая смена")],
+        [KeyboardButton(text="💰 Зарплата"), KeyboardButton(text="👤 Личный кабинет")]
+    ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, is_persistent=True)
 
-def get_main_menu(is_admin=False):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📅 Мои смены", callback_data="my_shifts")
-    builder.button(text="⏰ Ближайшая смена", callback_data="next_shift")
-    builder.button(text="💰 Зарплата", callback_data="salary")
-    builder.button(text="🔻 Штраф", callback_data="add_fine")
-    builder.button(text="🔺 Докид", callback_data="add_bonus")
-    builder.button(text="📈 Сменить ставку", callback_data="change_rate")
-    builder.button(text="✏️ Сменить фамилию", callback_data="change_name")
-    if is_admin:
-        builder.button(text="⚙️ Админ-панель", callback_data="admin_panel")
-    builder.adjust(1)
-    return builder.as_markup()
+def get_salary_menu():
+    kb = [
+        [KeyboardButton(text="🔻 Штраф"), KeyboardButton(text="🔺 Докид")],
+        [KeyboardButton(text="🔙 Назад в меню")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-def get_admin_inline_menu(auto_status):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить смену", callback_data="add_shift")
-    builder.button(text="❌ Удалить смену", callback_data="delete_shift")
-    builder.button(text="⚡ Авто-синхронизация", callback_data="toggle_auto")
-    builder.button(text="🔄 Загрузить вручную", callback_data="import_gsheet")
-    builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
-    builder.adjust(1)
-    return builder.as_markup()
+def get_cabinet_menu():
+    kb = [
+        [KeyboardButton(text="📈 Сменить ставку"), KeyboardButton(text="✏️ Сменить фамилию")],
+        [KeyboardButton(text="🔙 Назад в меню")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# --- ОБРАБОТЧИКИ: МЕНЮ И СТАРТ ---
+def get_admin_menu(auto_status="Выкл"):
+    kb = [
+        [KeyboardButton(text="➕ Добавить смену"), KeyboardButton(text="❌ Удалить смену")],
+        [KeyboardButton(text="❌ Удалить пользователя"), KeyboardButton(text="⚡ Авто-синх")],
+        [KeyboardButton(text="🔄 Загрузить вручную"), KeyboardButton(text="🔙 Назад в меню")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+# --- СТАРТ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user = await get_user(message.from_user.id)
     if user:
         name, role = user
-        is_admin = message.from_user.id in ADMIN_IDS
         try: rate_val = int(role)
         except: rate_val = 0
         
         sched_info = await get_schedule_text()
-        
         await message.answer(
             f"Привет!\nЗагружено расписание на: <b>{sched_info}</b>\nТвоя ставка: <b>{rate_val} ₽</b>.", 
-            reply_markup=get_reply_menu(), 
+            reply_markup=get_main_menu(), 
             parse_mode="HTML"
         )
-        await message.answer("Выбери действие:", reply_markup=get_main_menu(is_admin))
     else:
-        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (так, как она записана в таблице):", reply_markup=get_reply_menu(), parse_mode="HTML")
+        await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\nНапиши свою <b>Фамилию</b> (как в таблице):", reply_markup=get_main_menu(), parse_mode="HTML")
         await state.set_state(RegState.waiting_for_name)
 
-@dp.message(F.text == "Меню")
-async def cmd_menu_button(message: types.Message, state: FSMContext):
+@dp.message(F.text == "🔙 Назад в меню")
+async def cmd_back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
-    user = await get_user(message.from_user.id)
-    if user:
-        name, role = user
-        is_admin = message.from_user.id in ADMIN_IDS
-        try: rate_val = int(role)
-        except: rate_val = 0
-        
-        sched_info = await get_schedule_text()
-        
-        await message.answer(
-            f"Главное меню:\nЗагружено расписание на: <b>{sched_info}</b>\nТвоя ставка: <b>{rate_val} ₽</b>", 
-            reply_markup=get_main_menu(is_admin), 
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer("Напиши свою <b>Фамилию</b> для регистрации:", reply_markup=get_reply_menu(), parse_mode="HTML")
-        await state.set_state(RegState.waiting_for_name)
+    await message.answer("Главное меню:", reply_markup=get_main_menu())
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+    if message.from_user.id not in ADMIN_IDS: return
     await state.clear()
-    
-    auto_month = await get_setting("sync_month")
-    auto_year = await get_setting("sync_year")
-    auto_status = f"Вкл ({auto_month}.{auto_year})" if auto_month else "Выкл"
-    
-    await message.answer(f"⚙️ Админ-панель:\nАвтосинхронизация: <b>{auto_status}</b>", reply_markup=get_admin_inline_menu(auto_status), parse_mode="HTML")
+    await message.answer("⚙️ Админ-панель:", reply_markup=get_admin_menu())
 
-# --- РЕГИСТРАЦИЯ С АВТО-ПОДГРУЗКОЙ СМЕН ---
+# --- РЕГИСТРАЦИЯ ---
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    builder = InlineKeyboardBuilder()
-    builder.button(text="2800 ₽", callback_data="role_2800")
-    builder.button(text="3100 ₽", callback_data="role_3100")
-    builder.button(text="3500 ₽", callback_data="role_3500")
-    builder.adjust(1)
-    await message.answer("Теперь выбери свою ставку:", reply_markup=builder.as_markup())
+    user_input = message.text.strip()
+    async with aiosqlite.connect("king_tabak.db") as db:
+        async with db.execute("SELECT COUNT(*) FROM valid_names") as cursor:
+            count = (await cursor.fetchone())[0]
+        if count > 0:
+            async with db.execute("SELECT name FROM valid_names WHERE name LIKE ?", (f"%{user_input}%",)) as cursor:
+                valid = await cursor.fetchone()
+            if not valid:
+                await message.answer("❌ <b>Ошибка:</b> Фамилия не зарегистрирована в расписании.", parse_mode="HTML")
+                return
 
-@dp.callback_query(F.data.startswith("role_"))
-async def process_role(callback: types.CallbackQuery, state: FSMContext):
-    role = callback.data.split("_")[1]
+    await state.update_data(name=user_input)
+    
+    kb = [[KeyboardButton(text="2800 ₽"), KeyboardButton(text="3100 ₽"), KeyboardButton(text="3500 ₽")]]
+    await message.answer("Теперь выбери свою ставку:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+
+@dp.message(F.text.in_(["2800 ₽", "3100 ₽", "3500 ₽"]))
+async def process_role(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != RegState.waiting_for_name.state: return # Защита от нажатия кнопок ставки вне регистрации
+
+    role = message.text.replace(" ₽", "")
     user_data = await state.get_data()
     name = user_data.get("name")
-    await save_user(callback.from_user.id, name, role)
+    await save_user(message.from_user.id, name, role)
     
-    is_admin = callback.from_user.id in ADMIN_IDS
     sched_info = await get_schedule_text()
-    
     last_month = await get_setting("last_loaded_month")
     last_year = await get_setting("last_loaded_year")
     
-    load_msg = ""
     if last_month and last_year:
-        load_msg = "\n\n⏳ Подгружаю твои смены из таблицы..."
-        await callback.message.answer(load_msg)
+        await message.answer("⏳ Подгружаю твои смены...")
         await process_and_save_sheet(int(last_month), int(last_year), is_auto=False, notify_users=False)
     
-    await callback.message.answer(
-        f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>\nЗагружено расписание на: <b>{sched_info}</b>\n\nЕсли твоих смен нет в «Моих сменах» — значит, админ еще не добавил тебя в таблицу.", 
-        reply_markup=get_reply_menu(), 
+    await message.answer(
+        f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>", 
+        reply_markup=get_main_menu(), 
         parse_mode="HTML"
     )
-    await callback.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
-    await state.clear()
-    await callback.answer()
-
-# --- ШТРАФЫ И ДОКИДЫ ---
-@dp.callback_query(F.data == "add_fine")
-async def btn_add_fine(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("🔻 <b>Оформление штрафа</b>\n\nВведи сумму штрафа (только число, например: <code>3000</code>):", parse_mode="HTML")
-    await state.set_state(TransactionState.waiting_for_fine)
-    await callback.answer()
-
-@dp.message(TransactionState.waiting_for_fine)
-async def process_fine(message: types.Message, state: FSMContext):
-    try:
-        amount = int(message.text.strip())
-        if amount <= 0: raise ValueError
-    except ValueError:
-        await message.answer("❌ Ошибка! Введи положительное число.")
-        return
-
-    today_str = date.today().strftime("%Y-%m-%d")
-    await add_transaction(message.from_user.id, "fine", amount, today_str)
-    
-    is_admin = message.from_user.id in ADMIN_IDS
-    await message.answer(f"✅ <b>Штраф успешно применен!</b>\n\nИз вашей зарплаты вычтено: <b>{amount} ₽</b>.", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
 
-@dp.callback_query(F.data == "add_bonus")
-async def btn_add_bonus(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("🔺 <b>Оформление докида</b>\n\nВведи сумму докида (только число, например: <code>1000</code>):", parse_mode="HTML")
-    await state.set_state(TransactionState.waiting_for_bonus)
-    await callback.answer()
-
-@dp.message(TransactionState.waiting_for_bonus)
-async def process_bonus(message: types.Message, state: FSMContext):
-    try:
-        amount = int(message.text.strip())
-        if amount <= 0: raise ValueError
-    except ValueError:
-        await message.answer("❌ Ошибка! Введи положительное число.")
-        return
-
-    today_str = date.today().strftime("%Y-%m-%d")
-    await add_transaction(message.from_user.id, "bonus", amount, today_str)
-    
-    is_admin = message.from_user.id in ADMIN_IDS
-    await message.answer(f"✅ <b>Докид успешно добавлен!</b>\n\nК вашей зарплате прибавлено: <b>{amount} ₽</b>.", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
-    await state.clear()
-
-# --- СМЕНА СТАВКИ И ФАМИЛИИ ---
-@dp.callback_query(F.data == "change_rate")
-async def btn_change_rate(callback: types.CallbackQuery):
-    user = await get_user(callback.from_user.id)
-    if not user: return
-    name, role = user
-    builder = InlineKeyboardBuilder()
-    if role not in ("2800", "3100", "3500"):
-        builder.button(text="Ставка 2800 ₽", callback_data="rate_2800")
-        builder.button(text="Ставка 3100 ₽", callback_data="rate_3100")
-        builder.button(text="Ставка 3500 ₽", callback_data="rate_3500")
-        msg_text = "Выбери свою ставку заново:"
-    else:
-        if role == "2800":
-            builder.button(text="⬆️ Повысить до 3100 ₽", callback_data="rate_3100")
-            msg_text = "Твоя текущая ставка: <b>2800 ₽</b>.\nХочешь повысить?"
-        elif role == "3100":
-            builder.button(text="⬇️ Понизить до 2800 ₽", callback_data="rate_2800")
-            builder.button(text="⬆️ Повысить до 3500 ₽", callback_data="rate_3500")
-            msg_text = "Твоя текущая ставка: <b>3100 ₽</b>.\nЧто хочешь сделать?"
-        elif role == "3500":
-            builder.button(text="⬇️ Понизить до 3100 ₽", callback_data="rate_3100")
-            msg_text = "Твоя текущая ставка: <b>3500 ₽</b>.\nХочешь понизить?"
-    builder.button(text="🔙 Отмена", callback_data="back_to_main")
-    builder.adjust(1)
-    await callback.message.answer(msg_text, reply_markup=builder.as_markup(), parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("rate_"))
-async def process_rate_change(callback: types.CallbackQuery):
-    new_rate = callback.data.split("_")[1]
-    await update_user_role(callback.from_user.id, new_rate)
-    is_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer(f"✅ Твоя ставка изменена на <b>{new_rate} ₽</b>!", parse_mode="HTML", reply_markup=get_main_menu(is_admin))
-    await callback.answer()
-
-@dp.callback_query(F.data == "change_name")
-async def btn_change_name(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введи свою новую <b>Фамилию</b>:", parse_mode="HTML")
-    await state.set_state(ChangeNameState.waiting_for_new_name)
-    await callback.answer()
-
-@dp.message(ChangeNameState.waiting_for_new_name)
-async def process_change_name(message: types.Message, state: FSMContext):
-    new_name = message.text.strip()
-    await update_user_name(message.from_user.id, new_name)
-    is_admin = message.from_user.id in ADMIN_IDS
-    await message.answer(f"✅ Твоя фамилия изменена на <b>{new_name}</b>!\n(Попроси админа загрузить расписание заново).", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
-    await state.clear()
-
-# --- МОИ СМЕНЫ (С ВЫБОРОМ МЕСЯЦА) ---
-@dp.callback_query(F.data == "my_shifts")
-async def btn_my_shifts(callback: types.CallbackQuery):
-    months = await get_user_shifts_months(callback.from_user.id)
+# --- МОИ СМЕНЫ ---
+@dp.message(F.text == "📅 Мои смены")
+async def btn_my_shifts(message: types.Message):
+    months = await get_user_shifts_months(message.from_user.id)
     if not months:
-        await callback.message.answer("У тебя пока нет смен в расписании.")
+        await message.answer("У тебя пока нет смен в расписании.")
     else:
-        builder = InlineKeyboardBuilder()
+        kb = []
+        row = []
         for (ym,) in months:
             year, month_num = ym.split("-")
             month_name = MONTHS_RU.get(int(month_num), month_num)
-            builder.button(text=f"{month_name} {year}", callback_data=f"my_shifts_month_{ym}")
-        builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
-        builder.adjust(2)
+            row.append(KeyboardButton(text=f"{month_name} {year}"))
+            if len(row) == 2:
+                kb.append(row)
+                row = []
+        if row: kb.append(row)
+        kb.append([KeyboardButton(text="🔙 Назад в меню")])
         
-        await callback.message.answer("Выбери месяц, за который хочешь посмотреть смены:", reply_markup=builder.as_markup())
-    await callback.answer()
+        await message.answer("Выбери месяц:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
 
-@dp.callback_query(F.data.startswith("my_shifts_month_"))
-async def btn_my_shifts_month(callback: types.CallbackQuery):
-    ym = callback.data.replace("my_shifts_month_", "")
-    year, month_num = ym.split("-")
-    month_name = MONTHS_RU.get(int(month_num), month_num)
+@dp.message(F.text.regexp(r"^(Январь|Февраль|Март|Апрель|Май|Июнь|Июль|Август|Сентябрь|Октябрь|Ноябрь|Декабрь) \d{4}$"))
+async def btn_my_shifts_month(message: types.Message):
+    month_name, year = message.text.split()
+    month_num = list(MONTHS_RU.keys())[list(MONTHS_RU.values()).index(month_name)]
+    ym = f"{year}-{month_num:02d}"
     
-    shifts = await get_user_shifts_by_month(callback.from_user.id, ym)
-    
+    shifts = await get_user_shifts_by_month(message.from_user.id, ym)
     if not shifts:
-        await callback.message.answer("За этот месяц смен нет.")
+        await message.answer("За этот месяц смен нет.")
     else:
         text = f"📅 <b>Твои смены за {month_name} {year}:</b>\n\n"
         for s in shifts:
             _, date_str, s_type, addr, repl, repl_by = s
             text += f"📆 {date_str} ({s_type})\n📍 {addr}\n🔄 Сменяю: {repl}\n👤 Сменяет: {repl_by}\n\n"
-            
-        builder = InlineKeyboardBuilder()
-        builder.button(text="🔙 К выбору месяца", callback_data="my_shifts")
-        builder.button(text="🏠 В главное меню", callback_data="back_to_main")
-        builder.adjust(1)
         
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    await callback.answer()
+        kb = [[KeyboardButton(text="📅 Другой месяц")], [KeyboardButton(text="🔙 Назад в меню")]]
+        await message.answer(text, parse_mode="HTML", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
 
-@dp.callback_query(F.data == "next_shift")
-async def btn_next_shift(callback: types.CallbackQuery):
-    shift = await get_next_shift(callback.from_user.id)
+@dp.message(F.text == "📅 Другой месяц")
+async def btn_another_month(message: types.Message):
+    await btn_my_shifts(message)
+
+# --- БЛИЖАЙШАЯ СМЕНА ---
+@dp.message(F.text == "⏰ Ближайшая смена")
+async def btn_next_shift(message: types.Message):
+    shift = await get_next_shift(message.from_user.id)
     if not shift:
-        await callback.message.answer("У тебя нет предстоящих смен.")
+        await message.answer("У тебя нет предстоящих смен.")
     else:
         date_str, s_type, addr, repl, repl_by = shift
         text = (f"⏰ <b>Твоя ближайшая смена:</b>\n\n📆 Дата: {date_str}\n🕒 Тип: {s_type}\n📍 Адрес: {addr}\n🔄 Сменяешь: {repl}\n👤 Сменяет тебя: {repl_by}")
-        await callback.message.answer(text, parse_mode="HTML")
-    await callback.answer()
+        await message.answer(text, parse_mode="HTML")
 
-@dp.callback_query(F.data == "salary")
-async def btn_salary(callback: types.CallbackQuery):
-    user = await get_user(callback.from_user.id)
+# --- ЗАРПЛАТА ---
+@dp.message(F.text == "💰 Зарплата")
+async def btn_salary(message: types.Message):
+    user = await get_user(message.from_user.id)
     if not user: return
     name, role = user
     today = date.today()
@@ -716,15 +583,15 @@ async def btn_salary(callback: types.CallbackQuery):
     end_inclusive_str = (end_date - timedelta(days=1)).strftime("%Y-%m-%d") 
 
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT COUNT(*) FROM shifts WHERE user_id = ? AND date >= ? AND date < ?", (callback.from_user.id, start_str, end_str)) as cursor:
+        async with db.execute("SELECT COUNT(*) FROM shifts WHERE user_id = ? AND date >= ? AND date < ?", (message.from_user.id, start_str, end_str)) as cursor:
             count = (await cursor.fetchone())[0]
 
     try: rate = int(role)
     except: rate = 0
         
     base_salary = count * rate
-    total_fines = await get_transactions_sum(callback.from_user.id, start_str, end_inclusive_str, "fine")
-    total_bonuses = await get_transactions_sum(callback.from_user.id, start_str, end_inclusive_str, "bonus")
+    total_fines = await get_transactions_sum(message.from_user.id, start_str, end_inclusive_str, "fine")
+    total_bonuses = await get_transactions_sum(message.from_user.id, start_str, end_inclusive_str, "bonus")
     final_salary = base_salary - total_fines + total_bonuses
 
     text = (
@@ -740,38 +607,102 @@ async def btn_salary(callback: types.CallbackQuery):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>К ВЫПЛАТЕ: {final_salary} ₽</b>"
     )
-    await callback.message.answer(text, parse_mode="HTML")
-    await callback.answer()
+    await message.answer(text, parse_mode="HTML", reply_markup=get_salary_menu())
 
-# --- АДМИН ПАНЕЛЬ (INLINE) ---
-@dp.callback_query(F.data == "admin_panel")
-async def btn_admin_panel(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("У тебя нет прав администратора!", show_alert=True)
+# --- ШТРАФЫ И ДОКИДЫ ---
+@dp.message(F.text == "🔻 Штраф")
+async def btn_add_fine(message: types.Message, state: FSMContext):
+    await message.answer("🔻 Введи сумму штрафа (только число, например: 3000):")
+    await state.set_state(TransactionState.waiting_for_fine)
+
+@dp.message(TransactionState.waiting_for_fine)
+async def process_fine(message: types.Message, state: FSMContext):
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0: raise ValueError
+    except ValueError:
+        await message.answer("❌ Ошибка! Введи положительное число.")
         return
-    
-    auto_month = await get_setting("sync_month")
-    auto_year = await get_setting("sync_year")
-    auto_status = f"Вкл ({auto_month}.{auto_year})" if auto_month else "Выкл"
-    await callback.message.answer(f"⚙️ Админ-панель:\nАвтосинхронизация: <b>{auto_status}</b>", reply_markup=get_admin_inline_menu(auto_status), parse_mode="HTML")
-    await callback.answer()
 
-@dp.callback_query(F.data == "toggle_auto")
-async def btn_toggle_auto(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
+    today_str = date.today().strftime("%Y-%m-%d")
+    await add_transaction(message.from_user.id, "fine", amount, today_str)
+    await message.answer(f"✅ Штраф <b>{amount} ₽</b> применен.", reply_markup=get_salary_menu(), parse_mode="HTML")
+    await state.clear()
+
+@dp.message(F.text == "🔺 Докид")
+async def btn_add_bonus(message: types.Message, state: FSMContext):
+    await message.answer("🔺 Введи сумму докида (только число, например: 1000):")
+    await state.set_state(TransactionState.waiting_for_bonus)
+
+@dp.message(TransactionState.waiting_for_bonus)
+async def process_bonus(message: types.Message, state: FSMContext):
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0: raise ValueError
+    except ValueError:
+        await message.answer("❌ Ошибка! Введи положительное число.")
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    await add_transaction(message.from_user.id, "bonus", amount, today_str)
+    await message.answer(f"✅ Докид <b>{amount} ₽</b> добавлен.", reply_markup=get_salary_menu(), parse_mode="HTML")
+    await state.clear()
+
+# --- ЛИЧНЫЙ КАБИНЕТ ---
+@dp.message(F.text == "👤 Личный кабинет")
+async def btn_cabinet(message: types.Message):
+    await message.answer("👤 <b>Личный кабинет</b>\nВыбери действие:", reply_markup=get_cabinet_menu(), parse_mode="HTML")
+
+@dp.message(F.text == "📈 Сменить ставку")
+async def btn_change_rate(message: types.Message):
+    kb = [[KeyboardButton(text="2800 ₽"), KeyboardButton(text="3100 ₽"), KeyboardButton(text="3500 ₽")], [KeyboardButton(text="🔙 Назад в меню")]]
+    await message.answer("Выбери новую ставку:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+
+@dp.message(F.text == "✏️ Сменить фамилию")
+async def btn_change_name(message: types.Message, state: FSMContext):
+    await message.answer("Введи свою новую <b>Фамилию</b>:", parse_mode="HTML")
+    await state.set_state(ChangeNameState.waiting_for_new_name)
+
+@dp.message(ChangeNameState.waiting_for_new_name)
+async def process_change_name(message: types.Message, state: FSMContext):
+    new_name = message.text.strip()
+    async with aiosqlite.connect("king_tabak.db") as db:
+        async with db.execute("SELECT name FROM valid_names WHERE name LIKE ?", (f"%{new_name}%",)) as cursor:
+            valid = await cursor.fetchone()
+        if not valid:
+            await message.answer("❌ <b>Ошибка:</b> Фамилия не зарегистрирована в расписании.", parse_mode="HTML")
+            return
+
+    await update_user_name(message.from_user.id, new_name)
+    await message.answer(f"✅ Твоя фамилия изменена на <b>{new_name}</b>!", reply_markup=get_main_menu(), parse_mode="HTML")
+    await state.clear()
+
+# Обработка выбора ставки (в личном кабинете)
+@dp.message(F.text.in_(["2800 ₽", "3100 ₽", "3500 ₽"]))
+async def process_cabinet_role(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == RegState.waiting_for_name.state: return # уже обработано выше
     
+    new_rate = message.text.replace(" ₽", "")
+    await update_user_role(message.from_user.id, new_rate)
+    await message.answer(f"✅ Твоя ставка изменена на <b>{new_rate} ₽</b>!", reply_markup=get_main_menu(), parse_mode="HTML")
+
+# --- АДМИН ПАНЕЛЬ ---
+@dp.message(F.text == "⚡ Авто-синх")
+async def btn_toggle_auto(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
     auto_month = await get_setting("sync_month")
     if auto_month:
         await set_setting("sync_month", "")
         await set_setting("sync_year", "")
-        await callback.message.answer("❌ Автосинхронизация выключена.")
+        await message.answer("❌ Автосинхронизация выключена.")
     else:
-        await callback.message.answer("Введи месяц и год для автосинхронизации (например: <b>10 2026</b>):", parse_mode="HTML")
+        await message.answer("Введи месяц и год для автосинхронизации (например: 10 2026):")
         await state.set_state(AutoSyncState.waiting_for_sync_date)
-    await callback.answer()
 
 @dp.message(AutoSyncState.waiting_for_sync_date)
 async def process_toggle_auto_date(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
     try:
         month_str, year_str = message.text.split()
         month, year = int(month_str), int(year_str)
@@ -779,128 +710,169 @@ async def process_toggle_auto_date(message: types.Message, state: FSMContext):
         await set_setting("sync_year", str(year))
         
         success, msg = await process_and_save_sheet(month, year, is_auto=False)
-        await message.answer(f"✅ Автосинхронизация включена на {month:02d}.{year}!\n\nПервичная загрузка: {msg}")
+        await message.answer(f"✅ Автосинхронизация включена на {month:02d}.{year}!\n\n{msg}", reply_markup=get_admin_menu())
     except ValueError:
-        await message.answer("❌ Неверный формат. Напиши месяц и год через пробел (например, 10 2026).")
+        await message.answer("❌ Неверный формат. Напиши месяц и год через пробел.")
     await state.clear()
 
-@dp.callback_query(F.data == "back_to_main")
-async def btn_back_to_main(callback: types.CallbackQuery):
-    user = await get_user(callback.from_user.id)
-    is_admin = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
-    await callback.answer()
+@dp.message(F.text == "🔄 Загрузить вручную")
+async def btn_import_gsheet(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("Введи месяц и год для загрузки (например: 10 2026):")
+    await state.set_state(ImportState.waiting_for_gsheet_date)
 
-# --- АДМИН: УДАЛЕНИЕ / ДОБАВЛЕНИЕ / ИМПОРТ ---
-@dp.callback_query(F.data == "delete_shift")
-async def btn_delete_shift(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
+@dp.message(ImportState.waiting_for_gsheet_date)
+async def process_gsheet_date(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    try:
+        month_str, year_str = message.text.split()
+        month, year = int(month_str), int(year_str)
+    except ValueError:
+        await message.answer("❌ Неверный формат.")
+        return
+
+    await message.answer("⏳ Скачиваю...")
+    success, result_msg = await process_and_save_sheet(month, year, is_auto=False, notify_users=True)
+    await message.answer(result_msg, reply_markup=get_admin_menu())
+    await state.clear()
+
+@dp.message(F.text == "❌ Удалить пользователя")
+async def btn_delete_user_start(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
     users = await get_all_users()
-    builder = InlineKeyboardBuilder()
+    text = "Список пользователей:\n"
     for uid, name, role in users:
-        builder.button(text=f"{name} ({role}₽)", callback_data=f"deluser_{uid}")
-    builder.adjust(2)
-    await callback.message.answer("У кого удаляем смену?", reply_markup=builder.as_markup())
-    await state.set_state(DeleteShiftState.waiting_for_user)
-    await callback.answer()
+        text += f"• {name} ({role}₽)\n"
+    text += "\nВведи фамилию пользователя для удаления (или 'Отмена'):"
+    await message.answer(text)
+    await state.set_state(DeleteUserState.waiting_for_name)
 
-@dp.callback_query(DeleteShiftState.waiting_for_user, F.data.startswith("deluser_"))
-async def process_delete_user(callback: types.CallbackQuery, state: FSMContext):
-    user_id = int(callback.data.split("_")[1])
-    months = await get_user_shifts_months(user_id)
-    
-    if not months:
-        await callback.message.answer("У этого сотрудника нет смен.")
+@dp.message(DeleteUserState.waiting_for_name)
+async def process_delete_user(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    if message.text.lower() == "отмена":
+        await message.answer("Отменено.", reply_markup=get_admin_menu())
         await state.clear()
         return
         
-    builder = InlineKeyboardBuilder()
-    for (ym,) in months:
-        year, month_num = ym.split("-")
-        month_name = MONTHS_RU.get(int(month_num), month_num)
-        builder.button(text=f"❌ {month_name} {year}", callback_data=f"delmonth_{user_id}_{ym}")
-    builder.button(text="🔙 Отмена", callback_data="admin_panel")
-    builder.adjust(1)
-    
-    await callback.message.answer("Выбери месяц, в котором хочешь удалить смену:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("delmonth_"))
-async def process_delete_month_shifts(callback: types.CallbackQuery, state: FSMContext):
-    parts = callback.data.split("_")
-    user_id = int(parts[1])
-    ym = parts[2]
-    
-    shifts = await get_user_shifts_by_month(user_id, ym)
-    
-    builder = InlineKeyboardBuilder()
-    for shift in shifts:
-        s_id, s_date, s_type, s_addr, _, _ = shift
-        builder.button(text=f"❌ {s_date} ({s_type}) - {s_addr}", callback_data=f"delshift_{s_id}")
-    builder.button(text="🔙 Отмена", callback_data="delete_shift")
-    builder.adjust(1)
-    
-    await callback.message.answer("Выбери смену для удаления:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("delshift_"))
-async def process_delete_shift(callback: types.CallbackQuery, state: FSMContext):
-    shift_id = int(callback.data.split("_")[1])
-    await delete_shift_by_id(shift_id)
-    await callback.message.answer("✅ Смена удалена!")
+    user = await get_user_by_name(message.text.strip())
+    if user:
+        await delete_user_from_db(user[0])
+        await message.answer(f"✅ Пользователь {message.text} и его смены удалены.", reply_markup=get_admin_menu())
+    else:
+        await message.answer("❌ Пользователь не найден.", reply_markup=get_admin_menu())
     await state.clear()
-    await callback.answer()
 
-@dp.callback_query(F.data == "add_shift")
-async def btn_add_shift(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
+@dp.message(F.text == "❌ Удалить смену")
+async def btn_delete_shift_start(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    await message.answer("Введи фамилию сотрудника, у которого нужно удалить смену:")
+    await state.set_state(DeleteShiftState.waiting_for_name)
+
+@dp.message(DeleteShiftState.waiting_for_name)
+async def process_delete_shift_name(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    user = await get_user_by_name(message.text.strip())
+    if not user:
+        await message.answer("❌ Пользователь не найден.")
+        await state.clear()
+        return
+        
+    await state.update_data(target_id=user[0])
+    await message.answer("Введи месяц и год смены для удаления (например: 10 2026):")
+    await state.set_state(DeleteShiftState.waiting_for_month)
+
+@dp.message(DeleteShiftState.waiting_for_month)
+async def process_delete_shift_month(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    try:
+        month, year = map(int, message.text.split())
+        ym = f"{year}-{month:02d}"
+    except ValueError:
+        await message.answer("❌ Неверный формат.")
+        return
+        
+    data = await state.get_data()
+    target_id = data['target_id']
+    shifts = await get_user_shifts_by_month(target_id, ym)
+    
+    if not shifts:
+        await message.answer("За этот месяц смен нет.", reply_markup=get_admin_menu())
+        await state.clear()
+        return
+        
+    kb = []
+    for s in shifts:
+        s_id, s_date, s_type, s_addr, _, _ = s
+        kb.append([KeyboardButton(text=f"Удалить {s_date} ({s_type}) {s_addr}")])
+    kb.append([KeyboardButton(text="🔙 Назад в меню")])
+    
+    # Сохраняем маппинг кнопок в стейт, чтобы потом удалить
+    btn_map = {f"Удалить {s[1]} ({s[2]}) {s[3]}": s[0] for s in shifts}
+    await state.update_data(btn_map=btn_map)
+    
+    await message.answer("Выбери смену для удаления (нажми кнопку):", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+
+@dp.message(F.text.startswith("Удалить "))
+async def process_delete_shift_confirm(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    btn_map = data.get('btn_map', {})
+    if message.text in btn_map:
+        shift_id = btn_map[message.text]
+        await delete_shift_by_id(shift_id)
+        await message.answer("✅ Смена удалена!", reply_markup=get_admin_menu())
+        await state.clear()
+
+# --- ДОБАВЛЕНИЕ СМЕНЫ ---
+@dp.message(F.text == "➕ Добавить смену")
+async def btn_add_shift(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
     users = await get_all_users()
-    builder = InlineKeyboardBuilder()
+    text = "Список пользователей:\n"
     for uid, name, role in users:
-        builder.button(text=name, callback_data=f"shift_user_{uid}")
-    builder.adjust(2)
-    await callback.message.answer("Кому добавляем смену?", reply_markup=builder.as_markup())
+        text += f"• {name}\n"
+    text += "\nВведи фамилию сотрудника, кому добавляем смену:"
+    await message.answer(text)
     await state.set_state(AddShiftState.waiting_for_user)
-    await callback.answer()
 
-@dp.callback_query(AddShiftState.waiting_for_user, F.data.startswith("shift_user_"))
-async def process_shift_user(callback: types.CallbackQuery, state: FSMContext):
-    user_id = int(callback.data.split("_")[2])
-    await state.update_data(target_user_id=user_id)
-    await callback.message.answer("Введи дату смены <b>ГГГГ-ММ-ДД</b>:", parse_mode="HTML")
+@dp.message(AddShiftState.waiting_for_user)
+async def process_add_shift_user(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    user = await get_user_by_name(message.text.strip())
+    if not user:
+        await message.answer("❌ Пользователь не найден.")
+        return
+    await state.update_data(target_user_id=user[0])
+    await message.answer("Введи дату смены (ГГГГ-ММ-ДД):")
     await state.set_state(AddShiftState.waiting_for_date)
-    await callback.answer()
 
 @dp.message(AddShiftState.waiting_for_date)
-async def process_shift_date(message: types.Message, state: FSMContext):
+async def process_add_shift_date(message: types.Message, state: FSMContext):
     await state.update_data(date=message.text)
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Дневная", callback_data="type_Дневная")
-    builder.button(text="Ночная", callback_data="type_Ночная")
-    await message.answer("Тип смены:", reply_markup=builder.as_markup())
+    kb = [[KeyboardButton(text="Дневная"), KeyboardButton(text="Ночная")]]
+    await message.answer("Тип смены:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
     await state.set_state(AddShiftState.waiting_for_type)
 
-@dp.callback_query(AddShiftState.waiting_for_type, F.data.startswith("type_"))
-async def process_shift_type(callback: types.CallbackQuery, state: FSMContext):
-    await state.update_data(shift_type=callback.data.split("_")[1])
-    await callback.message.answer("Адрес точки:")
+@dp.message(AddShiftState.waiting_for_type)
+async def process_add_shift_type(message: types.Message, state: FSMContext):
+    await state.update_data(shift_type=message.text)
+    await message.answer("Адрес точки:")
     await state.set_state(AddShiftState.waiting_for_address)
-    await callback.answer()
 
 @dp.message(AddShiftState.waiting_for_address)
-async def process_shift_address(message: types.Message, state: FSMContext):
+async def process_add_shift_address(message: types.Message, state: FSMContext):
     await state.update_data(address=message.text)
     await message.answer("Кого сменяешь? (или '-')")
     await state.set_state(AddShiftState.waiting_for_replaces)
 
 @dp.message(AddShiftState.waiting_for_replaces)
-async def process_shift_replaces(message: types.Message, state: FSMContext):
+async def process_add_shift_replaces(message: types.Message, state: FSMContext):
     await state.update_data(replaces=message.text)
     await message.answer("Кто сменяет? (или '-')")
     await state.set_state(AddShiftState.waiting_for_replaced_by)
 
 @dp.message(AddShiftState.waiting_for_replaced_by)
-async def process_shift_replaced_by(message: types.Message, state: FSMContext):
+async def process_add_shift_replaced_by(message: types.Message, state: FSMContext):
     await state.update_data(replaced_by=message.text)
     data = await state.get_data()
     
@@ -911,28 +883,7 @@ async def process_shift_replaced_by(message: types.Message, state: FSMContext):
         )
         await db.commit()
         
-    await message.answer("✅ Смена добавлена!", reply_markup=get_main_menu(True))
-    await state.clear()
-
-@dp.callback_query(F.data == "import_gsheet")
-async def btn_import_gsheet(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS: return
-    await callback.message.answer("Введи месяц и год для загрузки (например: <b>10 2026</b>):", parse_mode="HTML")
-    await state.set_state(ImportState.waiting_for_gsheet_date)
-    await callback.answer()
-
-@dp.message(ImportState.waiting_for_gsheet_date)
-async def process_gsheet_date(message: types.Message, state: FSMContext):
-    try:
-        month_str, year_str = message.text.split()
-        month, year = int(month_str), int(year_str)
-    except ValueError:
-        await message.answer("❌ Неверный формат. Напиши два числа через пробел.")
-        return
-
-    await message.answer("⏳ Скачиваю и обновляю данные...")
-    success, result_msg = await process_and_save_sheet(month, year, is_auto=False, notify_users=True)
-    await message.answer(result_msg)
+    await message.answer("✅ Смена добавлена!", reply_markup=get_admin_menu())
     await state.clear()
 
 # --- ЗАПУСК ---
