@@ -29,9 +29,9 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # --- СЛОВАРЬ МЕСЯЦЕВ ---
 MONTHS_RU = {
-    1: "январь", 2: "февраль", 3: "март", 4: "апрель",
-    5: "май", 6: "июнь", 7: "июль", 8: "август",
-    9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
 }
 
 # --- СОСТОЯНИЯ ---
@@ -102,7 +102,7 @@ async def get_schedule_text():
     if last_month and last_year:
         try:
             month_int = int(last_month)
-            month_name = MONTHS_RU.get(month_int, last_month)
+            month_name = MONTHS_RU.get(month_int, last_month).lower()
             return f"{month_name} {last_year}"
         except ValueError:
             return "неизвестно"
@@ -139,13 +139,11 @@ async def get_all_users():
         async with db.execute("SELECT telegram_id, name, role FROM users") as cursor:
             return await cursor.fetchall()
 
-# --- ОПТИМИЗИРОВАННАЯ ФУНКЦИЯ ПОИСКА БЛИЖАЙШЕЙ СМЕНЫ ---
 async def get_next_shift(user_id):
     now = datetime.now(MOSCOW_TZ)
     today_str = now.strftime("%Y-%m-%d")
     
     async with aiosqlite.connect("king_tabak.db") as db:
-        # Берем все смены, начиная с сегодняшней даты
         async with db.execute(
             "SELECT date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? AND date >= ? ORDER BY date ASC",
             (user_id, today_str)
@@ -154,15 +152,10 @@ async def get_next_shift(user_id):
             
     for s in shifts:
         s_date, s_type, addr, repl, repl_by = s
-        
-        # Определяем время начала смены
         start_hour = 10 if "День" in s_type else 22
         s_dt = datetime.strptime(f"{s_date} {start_hour}:00:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=MOSCOW_TZ)
-        
-        # Если время начала смены еще не наступило (например, сейчас 15:00, а смена в 22:00) — это и есть ближайшая
         if now < s_dt:
             return s
-            
     return None
 
 async def get_user_shifts(user_id):
@@ -200,7 +193,6 @@ async def get_transactions_sum(user_id, start_date, end_date, t_type):
 
 # --- ФОНОВЫЕ ВОРКЕРЫ (НАПОМИНАНИЯ) ---
 async def daily_closing_reminder_worker():
-    # Напоминание в 21:45 для дневных смен
     while True:
         now = datetime.now(MOSCOW_TZ)
         target_time = time(21, 45, 0)
@@ -232,7 +224,6 @@ async def daily_closing_reminder_worker():
         await asyncio.sleep(60)
 
 async def shift_reminders_worker():
-    # Напоминания: Дневникам в 16:00 накануне, Ночникам в 12:00 в день смены
     last_day_rem = None
     last_night_rem = None
     
@@ -365,10 +356,8 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
 
         notified_users = set()
         
-        # 1. Очищаем старые смены за этот месяц
         await clear_shifts_for_month(month, year)
 
-        # 2. Собираем ВСЕ смены в один список для быстрой записи
         insert_data = []
         for addr, shifts in locations.items():
             shifts.sort(key=sort_key) 
@@ -387,7 +376,6 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
                     ))
                     notified_users.add(shifts[i]['user_id'])
 
-        # 3. Записываем всё в базу ОДНИМ ЗАПРОСОМ (executemany)
         success_count = 0
         if insert_data:
             async with aiosqlite.connect("king_tabak.db") as db:
@@ -544,7 +532,6 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
     if last_month and last_year:
         load_msg = "\n\n⏳ Подгружаю твои смены из таблицы..."
         await callback.message.answer(load_msg)
-        # Запускаем парсер в тихом режиме (notify_users=False). Теперь это займет 1 секунду!
         await process_and_save_sheet(int(last_month), int(last_year), is_auto=False, notify_users=False)
     
     await callback.message.answer(
@@ -651,17 +638,31 @@ async def process_change_name(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Твоя фамилия изменена на <b>{new_name}</b>!\n(Попроси админа загрузить расписание заново).", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
 
-# --- МОИ СМЕНЫ / БЛИЖАЙШАЯ / ЗАРПЛАТА ---
+# --- МОИ СМЕНЫ (С ГРУППИРОВКОЙ ПО МЕСЯЦАМ) ---
 @dp.callback_query(F.data == "my_shifts")
 async def btn_my_shifts(callback: types.CallbackQuery):
     shifts = await get_user_shifts(callback.from_user.id)
     if not shifts:
         await callback.message.answer("У тебя пока нет смен в расписании.")
     else:
-        text = "📅 <b>Твои смены:</b>\n\n"
+        text = "📅 <b>Твои смены:</b>\n"
+        current_month = ""
+        
         for s in shifts:
             _, date_str, s_type, addr, repl, repl_by = s
+            
+            # date_str имеет формат YYYY-MM-DD
+            year = date_str[:4]
+            month = int(date_str[5:7])
+            month_key = f"{year}-{month}"
+            
+            if month_key != current_month:
+                month_name = MONTHS_RU.get(month, str(month))
+                text += f"\n<b>{month_name} {year}</b>\n"
+                current_month = month_key
+                
             text += f"📆 {date_str} ({s_type})\n📍 {addr}\n🔄 Сменяю: {repl}\n👤 Сменяет: {repl_by}\n\n"
+            
         await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
@@ -896,7 +897,6 @@ async def process_gsheet_date(message: types.Message, state: FSMContext):
 # --- ЗАПУСК ---
 async def main():
     await init_db()
-    # Запускаем все фоновые процессы
     asyncio.create_task(auto_sync_worker())
     asyncio.create_task(daily_closing_reminder_worker())
     asyncio.create_task(shift_reminders_worker())
