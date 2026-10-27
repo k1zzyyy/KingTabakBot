@@ -158,9 +158,14 @@ async def get_next_shift(user_id):
             return s
     return None
 
-async def get_user_shifts(user_id):
+async def get_user_shifts_months(user_id):
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT id, date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? ORDER BY date", (user_id,)) as cursor:
+        async with db.execute("SELECT DISTINCT substr(date, 1, 7) FROM shifts WHERE user_id = ? ORDER BY date DESC", (user_id,)) as cursor:
+            return await cursor.fetchall()
+
+async def get_user_shifts_by_month(user_id, year_month):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        async with db.execute("SELECT id, date, shift_type, address, replaces, replaced_by FROM shifts WHERE user_id = ? AND date LIKE ? ORDER BY date", (user_id, f"{year_month}-%")) as cursor:
             return await cursor.fetchall()
 
 async def delete_shift_by_id(shift_id):
@@ -638,32 +643,46 @@ async def process_change_name(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Твоя фамилия изменена на <b>{new_name}</b>!\n(Попроси админа загрузить расписание заново).", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
 
-# --- МОИ СМЕНЫ (С ГРУППИРОВКОЙ ПО МЕСЯЦАМ) ---
+# --- МОИ СМЕНЫ (С ВЫБОРОМ МЕСЯЦА) ---
 @dp.callback_query(F.data == "my_shifts")
 async def btn_my_shifts(callback: types.CallbackQuery):
-    shifts = await get_user_shifts(callback.from_user.id)
-    if not shifts:
+    months = await get_user_shifts_months(callback.from_user.id)
+    if not months:
         await callback.message.answer("У тебя пока нет смен в расписании.")
     else:
-        text = "📅 <b>Твои смены:</b>\n"
-        current_month = ""
+        builder = InlineKeyboardBuilder()
+        for (ym,) in months:
+            year, month_num = ym.split("-")
+            month_name = MONTHS_RU.get(int(month_num), month_num)
+            builder.button(text=f"{month_name} {year}", callback_data=f"my_shifts_month_{ym}")
+        builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
+        builder.adjust(2)
         
+        await callback.message.answer("Выбери месяц, за который хочешь посмотреть смены:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("my_shifts_month_"))
+async def btn_my_shifts_month(callback: types.CallbackQuery):
+    ym = callback.data.replace("my_shifts_month_", "")
+    year, month_num = ym.split("-")
+    month_name = MONTHS_RU.get(int(month_num), month_num)
+    
+    shifts = await get_user_shifts_by_month(callback.from_user.id, ym)
+    
+    if not shifts:
+        await callback.message.answer("За этот месяц смен нет.")
+    else:
+        text = f"📅 <b>Твои смены за {month_name} {year}:</b>\n\n"
         for s in shifts:
             _, date_str, s_type, addr, repl, repl_by = s
-            
-            # date_str имеет формат YYYY-MM-DD
-            year = date_str[:4]
-            month = int(date_str[5:7])
-            month_key = f"{year}-{month}"
-            
-            if month_key != current_month:
-                month_name = MONTHS_RU.get(month, str(month))
-                text += f"\n<b>{month_name} {year}</b>\n"
-                current_month = month_key
-                
             text += f"📆 {date_str} ({s_type})\n📍 {addr}\n🔄 Сменяю: {repl}\n👤 Сменяет: {repl_by}\n\n"
             
-        await callback.message.answer(text, parse_mode="HTML")
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 К выбору месяца", callback_data="my_shifts")
+        builder.button(text="🏠 В главное меню", callback_data="back_to_main")
+        builder.adjust(1)
+        
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data == "next_shift")
@@ -788,17 +807,39 @@ async def btn_delete_shift(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(DeleteShiftState.waiting_for_user, F.data.startswith("deluser_"))
 async def process_delete_user(callback: types.CallbackQuery, state: FSMContext):
     user_id = int(callback.data.split("_")[1])
-    shifts = await get_user_shifts(user_id)
-    if not shifts:
+    months = await get_user_shifts_months(user_id)
+    
+    if not months:
         await callback.message.answer("У этого сотрудника нет смен.")
         await state.clear()
         return
+        
+    builder = InlineKeyboardBuilder()
+    for (ym,) in months:
+        year, month_num = ym.split("-")
+        month_name = MONTHS_RU.get(int(month_num), month_num)
+        builder.button(text=f"❌ {month_name} {year}", callback_data=f"delmonth_{user_id}_{ym}")
+    builder.button(text="🔙 Отмена", callback_data="admin_panel")
+    builder.adjust(1)
+    
+    await callback.message.answer("Выбери месяц, в котором хочешь удалить смену:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delmonth_"))
+async def process_delete_month_shifts(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    user_id = int(parts[1])
+    ym = parts[2]
+    
+    shifts = await get_user_shifts_by_month(user_id, ym)
+    
     builder = InlineKeyboardBuilder()
     for shift in shifts:
         s_id, s_date, s_type, s_addr, _, _ = shift
         builder.button(text=f"❌ {s_date} ({s_type}) - {s_addr}", callback_data=f"delshift_{s_id}")
-    builder.button(text="🔙 Отмена", callback_data="admin_panel")
+    builder.button(text="🔙 Отмена", callback_data="delete_shift")
     builder.adjust(1)
+    
     await callback.message.answer("Выбери смену для удаления:", reply_markup=builder.as_markup())
     await callback.answer()
 
