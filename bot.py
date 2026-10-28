@@ -412,20 +412,32 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer(f"Привет, {admin[0]}!", reply_markup=get_admin_inline_kb())
         return
 
-    # Если не найден ни там, ни там
     await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\n<b>Кто ты?</b>", reply_markup=get_start_inline_kb(), parse_mode="HTML")
 
 # --- ВЫБОР РОЛИ ---
 @dp.callback_query(F.data == "role_seller")
 async def cb_role_seller(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Напиши свою <b>Фамилию</b> (как в таблице):", parse_mode="HTML")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад", callback_data="role_back")
+    
+    await callback.message.edit_text("Напиши свою <b>Фамилию</b> (как в таблице):", reply_markup=builder.as_markup(), parse_mode="HTML")
     await state.set_state(RegState.waiting_for_name)
     await callback.answer()
 
 @dp.callback_query(F.data == "role_admin")
 async def cb_role_admin(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введи <b>специальный код администратора</b>:", parse_mode="HTML")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад", callback_data="role_back")
+    
+    await callback.message.edit_text("Введи <b>специальный код администратора</b>:", reply_markup=builder.as_markup(), parse_mode="HTML")
     await state.set_state(AuthState.waiting_for_code)
+    await callback.answer()
+
+# --- ВОЗВРАТ ИЗ МЕНЮ ВЫБОРА РОЛИ ---
+@dp.callback_query(F.data == "role_back")
+async def cb_role_back(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Привет! Я бот расписания сети Кинг Табак.\n\n<b>Кто ты?</b>", reply_markup=get_start_inline_kb(), parse_mode="HTML")
     await callback.answer()
 
 # --- АВТОРИЗАЦИЯ АДМИНА ---
@@ -433,15 +445,18 @@ async def cb_role_admin(callback: types.CallbackQuery, state: FSMContext):
 async def process_admin_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
     if code not in ADMIN_CODES:
-        await message.answer("❌ Неверный код администратора. Попробуй еще раз или нажми /start.")
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 Назад", callback_data="role_back")
+        await message.answer("❌ Неверный код администратора. Попробуй еще раз или вернись назад.", reply_markup=builder.as_markup())
         return
         
     name = ADMIN_CODES[code]
     
-    # Проверяем, не привязан ли код к другому ТГ
     bound_admin = await get_admin_by_code(code)
     if bound_admin and bound_admin[0] != message.from_user.id:
-        await message.answer("❌ Этот код уже привязан к другому аккаунту!")
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 Назад", callback_data="role_back")
+        await message.answer("❌ Этот код уже привязан к другому аккаунту!", reply_markup=builder.as_markup())
         await state.clear()
         return
 
@@ -467,7 +482,10 @@ async def process_name(message: types.Message, state: FSMContext):
             if (await cursor.fetchone())[0] > 0:
                 async with db.execute("SELECT name FROM valid_names WHERE name LIKE ?", (f"%{user_input}%",)) as c2:
                     if not await c2.fetchone():
-                        await message.answer("❌ <b>Ошибка:</b> Фамилия не зарегистрирована в расписании.", parse_mode="HTML")
+                        # Добавил кнопку "Назад" на случай ошибки
+                        builder = InlineKeyboardBuilder()
+                        builder.button(text="🔙 Назад", callback_data="role_back")
+                        await message.answer("❌ <b>Ошибка:</b> Фамилия не зарегистрирована в расписании.", reply_markup=builder.as_markup(), parse_mode="HTML")
                         return
 
     await state.update_data(name=user_input)
@@ -641,8 +659,7 @@ async def cb_adm_import(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ImportState.waiting_for_gsheet_date)
 async def process_import_date(message: types.Message, state: FSMContext):
-    try:
-        m, y = map(int, message.text.split())
+    try: m, y = map(int, message.text.split())
     except: return await message.answer("Ошибка формата.")
     await message.answer("⏳ Скачиваю...")
     _, msg = await process_and_save_sheet(m, y, is_auto=False)
