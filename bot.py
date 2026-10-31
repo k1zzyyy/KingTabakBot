@@ -27,7 +27,7 @@ ADMIN_CODES = {
     "ZAHAR777": "Захар"
 }
 
-# 🗺️ ПОЛНЫЙ СПИСОК ТОЧЕК СО ССЫЛКАМИ
+# 🗺️ ВСЕ КЛЮЧИ ТЕПЕРЬ В ВЕРХНЕМ РЕГИСТРЕ!
 POINTS_DATA = {
     "Л41": {"full": "Кинг Табак (Л41)", "address": "Лиговский проспект 41", "line": "Красная ветка", "station": "Площадь Восстания", "chat": "https://yandex.ru/chat/#/join/e7586022-f0c3-4f45-8e11-ebb2dc888cc1"},
     "Л43": {"full": "Кинг Табак (Л43)", "address": "Лиговский проспект 43", "line": "Красная ветка", "station": "Площадь Восстания", "chat": "https://yandex.ru/chat/#/join/df5a7902-2891-4c76-93d8-17beccd80d86"},
@@ -55,12 +55,28 @@ POINTS_DATA = {
     "Б13": {"full": "Кинг Табак (Б13)", "address": "Большая Зеленина 13", "line": "Фиолетовая ветка", "station": "Чкаловская", "chat": "https://yandex.ru/chat/#/join/4c4536b5-2266-4c94-a9b2-0974f45a16ca"},
     "П19": {"full": "Кинг Табак (П19)", "address": "Проспект просвещения 19", "line": "Синяя ветка", "station": "Проспект просвещения", "chat": "https://yandex.ru/chat/#/join/113c02ad-219a-4e23-831c-b0d44caca9bc"},
     "К4": {"full": "Кинг Табак (К4)", "address": "Каменноостровский 4", "line": "Синяя ветка", "station": "Горьковская", "chat": "https://yandex.ru/chat/#/join/9099bb6f-f84f-4ac4-b13d-116837e1eeee"},
-    "л61кио": {"full": "Кинг Табак (Лесная 61 Киоск)", "address": "Лесная 61", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/46c266c8-2c3b-4752-8f33-8aff9b95f09f"},
-    "к23": {"full": "Кинг Табак (Лесная павильон)", "address": "Лесная павильон", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/7eb4d39b-1d61-4d49-8298-f12521a5905d"},
-    "л61дом": {"full": "Кинг Табак (Лесная 61 Дом)", "address": "Лесная 61", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/ba22d7f8-62f6-4f8b-a8d0-e2202d020ba3"},
+    "Л61КИО": {"full": "Кинг Табак (Лесная 61 Киоск)", "address": "Лесная 61", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/46c266c8-2c3b-4752-8f33-8aff9b95f09f"},
+    "К23": {"full": "Кинг Табак (Лесная павильон)", "address": "Лесная павильон", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/7eb4d39b-1d61-4d49-8298-f12521a5905d"},
+    "Л61ДОМ": {"full": "Кинг Табак (Лесная 61 Дом)", "address": "Лесная 61", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/ba22d7f8-62f6-4f8b-a8d0-e2202d020ba3"},
     "Z6": {"full": "Кинг Табак (Звенигородская 6)", "address": "Звенигородская 6", "line": "Фиолетовая ветка", "station": "Звенигородская", "chat": "https://yandex.ru/chat/#/join/0703d062-8304-4762-a220-2e9f253465ad"},
     "К18": {"full": "Кинг Табак (Кирочная 18)", "address": "Кирочная 18", "line": "Красная ветка", "station": "Чернышевская", "chat": "https://yandex.ru/chat/#/join/827d95ed-22fd-4e4d-85fa-314b488a2402"}
 }
+
+# Вспомогательная функция для поиска точки
+def get_point_info(query):
+    query_upper = query.strip().upper()
+    
+    # 1. Прямое совпадение по коду (Н27)
+    if query_upper in POINTS_DATA:
+        return query_upper, POINTS_DATA[query_upper]
+        
+    # 2. Поиск по адресу (для инлайн-кнопок из таблицы)
+    # Например, если в таблице написано "Лесной 61А (Кио Кухня)", мы ищем "Лесная 61"
+    for key, pt in POINTS_DATA.items():
+        if pt["address"].upper() in query_upper or query_upper in pt["address"].upper():
+            return key, pt
+            
+    return None, None
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -456,7 +472,7 @@ async def cb_role_back(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Привет! Я бот расписания сети Кинг Табак.\n\n<b>Кто ты?</b>", reply_markup=get_start_inline_kb(), parse_mode="HTML")
     await callback.answer()
 
-# --- ВХОД КАК АДМИН ИЗ КАБИНЕТА ---
+# --- ВХОД КАК АДМИН ---
 @dp.message(F.text == "👑 Войти как админ")
 async def btn_login_as_admin(message: types.Message, state: FSMContext):
     admin = await get_admin(message.from_user.id)
@@ -534,11 +550,11 @@ async def cmd_back_to_main(message: types.Message, state: FSMContext):
     is_admin = bool(await get_admin(message.from_user.id))
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
 
-# 🗺️ КНОПКА "ТОЧКИ" (ТОЛЬКО ДЛЯ АДМИНОВ)
+# 🗺️ КНОПКА "ТОЧКИ"
 @dp.message(F.text == "🗺 Точки")
 async def btn_points(message: types.Message, state: FSMContext):
     is_admin = bool(await get_admin(message.from_user.id))
-    if not is_admin: return # Игнорируем, если не админ
+    if not is_admin: return 
     
     await message.answer("Введи сокращенное название точки (например: Н27, Л44):", reply_markup=get_cancel_point_menu())
     await state.set_state(PointState.waiting_for_query)
@@ -548,11 +564,11 @@ async def process_point_query(message: types.Message, state: FSMContext):
     is_admin = bool(await get_admin(message.from_user.id))
     if not is_admin: return
     
-    query = message.text.strip().upper() 
+    query = message.text.strip()
+    key, pt = get_point_info(query)
     
-    if query in POINTS_DATA:
-        pt = POINTS_DATA[query]
-        text = (f"🗺 <b>Информация о точке {query}</b>\n\n"
+    if pt:
+        text = (f"🗺 <b>Информация о точке {key}</b>\n\n"
                 f"🏢 <b>Название:</b> {pt['full']}\n"
                 f"📍 <b>Адрес:</b> {pt['address']}\n"
                 f"🚇 <b>Ветка:</b> {pt['line']}\n"
@@ -608,7 +624,7 @@ async def btn_next_shift(message: types.Message):
     else:
         await message.answer(text, parse_mode="HTML")
 
-# Обработчик инлайн-кнопки инфы о точке (ТОЛЬКО АДМИНЫ)
+# Обработчик инлайн-кнопки инфы о точке
 @dp.callback_query(F.data.startswith("point_info_"))
 async def cb_point_info(callback: types.CallbackQuery):
     is_admin = bool(await get_admin(callback.from_user.id))
@@ -616,10 +632,11 @@ async def cb_point_info(callback: types.CallbackQuery):
         await callback.answer("У вас нет прав для просмотра этой информации.", show_alert=True)
         return
         
-    query = callback.data.replace("point_info_", "").strip().upper()
-    if query in POINTS_DATA:
-        pt = POINTS_DATA[query]
-        text = (f"🗺 <b>Информация о точке {query}</b>\n\n"
+    query = callback.data.replace("point_info_", "").strip()
+    key, pt = get_point_info(query)
+    
+    if pt:
+        text = (f"🗺 <b>Информация о точке {key}</b>\n\n"
                 f"🏢 <b>Название:</b> {pt['full']}\n"
                 f"📍 <b>Адрес:</b> {pt['address']}\n"
                 f"🚇 <b>Ветка:</b> {pt['line']}\n"
