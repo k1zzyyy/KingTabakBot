@@ -27,7 +27,7 @@ ADMIN_CODES = {
     "ZAHAR777": "Захар"
 }
 
-# 🗺️ ВСЕ КЛЮЧИ ТЕПЕРЬ В ВЕРХНЕМ РЕГИСТРЕ!
+# 🗺️ ВСЕ КЛЮЧИ В ВЕРХНЕМ РЕГИСТРЕ. ИСПРАВЛЕНО НАЗВАНИЕ Л61КИО!
 POINTS_DATA = {
     "Л41": {"full": "Кинг Табак (Л41)", "address": "Лиговский проспект 41", "line": "Красная ветка", "station": "Площадь Восстания", "chat": "https://yandex.ru/chat/#/join/e7586022-f0c3-4f45-8e11-ebb2dc888cc1"},
     "Л43": {"full": "Кинг Табак (Л43)", "address": "Лиговский проспект 43", "line": "Красная ветка", "station": "Площадь Восстания", "chat": "https://yandex.ru/chat/#/join/df5a7902-2891-4c76-93d8-17beccd80d86"},
@@ -55,14 +55,14 @@ POINTS_DATA = {
     "Б13": {"full": "Кинг Табак (Б13)", "address": "Большая Зеленина 13", "line": "Фиолетовая ветка", "station": "Чкаловская", "chat": "https://yandex.ru/chat/#/join/4c4536b5-2266-4c94-a9b2-0974f45a16ca"},
     "П19": {"full": "Кинг Табак (П19)", "address": "Проспект просвещения 19", "line": "Синяя ветка", "station": "Проспект просвещения", "chat": "https://yandex.ru/chat/#/join/113c02ad-219a-4e23-831c-b0d44caca9bc"},
     "К4": {"full": "Кинг Табак (К4)", "address": "Каменноостровский 4", "line": "Синяя ветка", "station": "Горьковская", "chat": "https://yandex.ru/chat/#/join/9099bb6f-f84f-4ac4-b13d-116837e1eeee"},
-    "Л61КИО": {"full": "Кинг Табак (Лесная 61 Киоск)", "address": "Лесная 61", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/46c266c8-2c3b-4752-8f33-8aff9b95f09f"},
+    "Л61КИО": {"full": "Кинг Табак (Лесная 61 Кио Кухня)", "address": "Лесной 61А", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/46c266c8-2c3b-4752-8f33-8aff9b95f09f"},
     "К23": {"full": "Кинг Табак (Лесная павильон)", "address": "Лесная павильон", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/7eb4d39b-1d61-4d49-8298-f12521a5905d"},
     "Л61ДОМ": {"full": "Кинг Табак (Лесная 61 Дом)", "address": "Лесная 61", "line": "Красная ветка", "station": "Лесная", "chat": "https://yandex.ru/chat/#/join/ba22d7f8-62f6-4f8b-a8d0-e2202d020ba3"},
     "Z6": {"full": "Кинг Табак (Звенигородская 6)", "address": "Звенигородская 6", "line": "Фиолетовая ветка", "station": "Звенигородская", "chat": "https://yandex.ru/chat/#/join/0703d062-8304-4762-a220-2e9f253465ad"},
     "К18": {"full": "Кинг Табак (Кирочная 18)", "address": "Кирочная 18", "line": "Красная ветка", "station": "Чернышевская", "chat": "https://yandex.ru/chat/#/join/827d95ed-22fd-4e4d-85fa-314b488a2402"}
 }
 
-# Вспомогательная функция для поиска точки
+# Умный поиск точки
 def get_point_info(query):
     query_upper = query.strip().upper()
     
@@ -71,12 +71,14 @@ def get_point_info(query):
         return query_upper, POINTS_DATA[query_upper]
         
     # 2. Поиск по адресу (для инлайн-кнопок из таблицы)
-    # Например, если в таблице написано "Лесной 61А (Кио Кухня)", мы ищем "Лесная 61"
     for key, pt in POINTS_DATA.items():
-        if pt["address"].upper() in query_upper or query_upper in pt["address"].upper():
+        # Если адрес из базы (например "Лесной 61А") есть в запросе (Лесной 61А (Кио Кухня))
+        if pt["address"].upper() in query_upper:
             return key, pt
             
     return None, None
+
+# ... (ОСТАЛЬНОЙ КОД БЕЗ ИЗМЕНЕНИЙ ДО КОНЦА) ...
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -84,7 +86,6 @@ dp = Dispatcher()
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 MONTHS_RU = {1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 5: "Май", 6: "Июнь", 7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"}
 
-# --- СОСТОЯНИЯ ---
 class AuthState(StatesGroup):
     waiting_for_code = State()
 class RegState(StatesGroup):
@@ -113,7 +114,6 @@ class TransactionState(StatesGroup):
     waiting_for_fine = State()
     waiting_for_bonus = State()
 
-# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, name TEXT, role TEXT)")
@@ -239,7 +239,6 @@ async def get_transactions_sum(user_id, start_date, end_date, t_type):
             result = await cursor.fetchone()
             return result[0] if result[0] else 0
 
-# --- ФОНОВЫЕ ВОРКЕРЫ ---
 async def daily_closing_reminder_worker():
     while True:
         now = datetime.now(MOSCOW_TZ)
@@ -288,7 +287,6 @@ async def shift_reminders_worker():
                 except: pass
         await asyncio.sleep(60)
 
-# --- ПАРСИНГ ТАБЛИЦЫ ---
 async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
     try:
         async with aiohttp.ClientSession() as session:
@@ -383,7 +381,6 @@ async def auto_sync_worker():
             if m and y: await process_and_save_sheet(int(m), int(y), is_auto=True)
         except: pass
 
-# --- КЛАВИАТУРЫ ---
 def get_main_menu(is_admin=False):
     kb = [
         [KeyboardButton(text="📅 Мои смены"), KeyboardButton(text="⏰ Ближайшая смена")],
@@ -427,7 +424,6 @@ def get_admin_inline_kb():
     builder.adjust(1)
     return builder.as_markup()
 
-# --- СТАРТ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -449,7 +445,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     await message.answer("Привет! Я бот расписания сети Кинг Табак.\n\n<b>Кто ты?</b>", reply_markup=get_start_inline_kb(), parse_mode="HTML")
 
-# --- ВЫБОР РОЛИ ---
 @dp.callback_query(F.data == "role_seller")
 async def cb_role_seller(callback: types.CallbackQuery, state: FSMContext):
     builder = InlineKeyboardBuilder()
@@ -472,7 +467,6 @@ async def cb_role_back(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Привет! Я бот расписания сети Кинг Табак.\n\n<b>Кто ты?</b>", reply_markup=get_start_inline_kb(), parse_mode="HTML")
     await callback.answer()
 
-# --- ВХОД КАК АДМИН ---
 @dp.message(F.text == "👑 Войти как админ")
 async def btn_login_as_admin(message: types.Message, state: FSMContext):
     admin = await get_admin(message.from_user.id)
@@ -512,7 +506,6 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=get_admin_inline_kb(), parse_mode="HTML")
 
-# --- РЕГИСТРАЦИЯ ПРОДАВЦА ---
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     user_input = message.text.strip()
@@ -543,14 +536,12 @@ async def process_role(message: types.Message, state: FSMContext):
     await message.answer(f"Регистрация завершена!\nФамилия: {name}\nТвоя ставка: <b>{role} ₽</b>", reply_markup=get_main_menu(False), parse_mode="HTML")
     await state.clear()
 
-# --- МЕНЮ ПРОДАВЦА ---
 @dp.message(F.text == "🔙 Назад в меню")
 async def cmd_back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     is_admin = bool(await get_admin(message.from_user.id))
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
 
-# 🗺️ КНОПКА "ТОЧКИ"
 @dp.message(F.text == "🗺 Точки")
 async def btn_points(message: types.Message, state: FSMContext):
     is_admin = bool(await get_admin(message.from_user.id))
@@ -607,7 +598,6 @@ async def btn_my_shifts_month(message: types.Message):
 @dp.message(F.text == "📅 Другой месяц")
 async def btn_another_month(message: types.Message): await btn_my_shifts(message)
 
-# ⏰ БЛИЖАЙШАЯ СМЕНА
 @dp.message(F.text == "⏰ Ближайшая смена")
 async def btn_next_shift(message: types.Message):
     shift = await get_next_shift(message.from_user.id)
@@ -624,7 +614,6 @@ async def btn_next_shift(message: types.Message):
     else:
         await message.answer(text, parse_mode="HTML")
 
-# Обработчик инлайн-кнопки инфы о точке
 @dp.callback_query(F.data.startswith("point_info_"))
 async def cb_point_info(callback: types.CallbackQuery):
     is_admin = bool(await get_admin(callback.from_user.id))
@@ -726,7 +715,6 @@ async def process_change_name(message: types.Message, state: FSMContext):
     await message.answer("✅ Фамилия изменена.", reply_markup=get_main_menu(is_admin))
     await state.clear()
 
-# --- ИНЛАЙН АДМИН ПАНЕЛЬ ---
 @dp.callback_query(F.data == "adm_back")
 async def cb_adm_back(callback: types.CallbackQuery):
     await callback.message.delete()
@@ -870,7 +858,6 @@ async def process_add_shift_repl_by(message: types.Message, state: FSMContext):
     await message.answer("✅ Смена добавлена!", reply_markup=get_admin_inline_kb())
     await state.clear()
 
-# --- ЗАПУСК ---
 async def main():
     await init_db()
     asyncio.create_task(auto_sync_worker())
