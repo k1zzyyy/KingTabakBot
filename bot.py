@@ -19,7 +19,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdmiCfg-6fTdd8PVGmKJQZgYUInzQodiRvZ5Ken1r2_Uh3SwbP87ZtuQwZ9Mcm6rRJ9cO7dh7Qso78/pub?output=csv")
-ADMIN_IDS = [7088621971] # Твой ID на всякий случай оставляем
+ADMIN_IDS = [7088621971] # Оставляем на всякий случай
 
 # Секретные коды админов
 ADMIN_CODES = {
@@ -28,7 +28,8 @@ ADMIN_CODES = {
     "ANDREY2734": "Андрей",
     "MARYAM8975": "Марьям",
     "USIF2380": "Юсиф",
-    "DANIIL9656": "Даниил"
+    "DANIIL9656": "Даниил",
+    "ZAHAR777": "Захар" # Твой код
 }
 
 bot = Bot(token=BOT_TOKEN)
@@ -372,6 +373,7 @@ def get_salary_menu():
 def get_cabinet_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📈 Сменить ставку"), KeyboardButton(text="✏️ Сменить фамилию")],
+        [KeyboardButton(text="👑 Войти как админ")],
         [KeyboardButton(text="🔙 Назад в меню")]
     ], resize_keyboard=True)
 
@@ -433,12 +435,22 @@ async def cb_role_admin(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AuthState.waiting_for_code)
     await callback.answer()
 
-# --- ВОЗВРАТ ИЗ МЕНЮ ВЫБОРА РОЛИ ---
 @dp.callback_query(F.data == "role_back")
 async def cb_role_back(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("Привет! Я бот расписания сети Кинг Табак.\n\n<b>Кто ты?</b>", reply_markup=get_start_inline_kb(), parse_mode="HTML")
     await callback.answer()
+
+# --- ВХОД КАК АДМИН ИЗ КАБИНЕТА ---
+@dp.message(F.text == "👑 Войти как админ")
+async def btn_login_as_admin(message: types.Message, state: FSMContext):
+    admin = await get_admin(message.from_user.id)
+    if admin:
+        await message.answer(f"Ты уже авторизован как {admin[0]}!", reply_markup=get_admin_inline_kb())
+        return
+        
+    await message.answer("Введи <b>специальный код администратора</b>:", parse_mode="HTML")
+    await state.set_state(AuthState.waiting_for_code)
 
 # --- АВТОРИЗАЦИЯ АДМИНА ---
 @dp.message(AuthState.waiting_for_code)
@@ -469,6 +481,8 @@ async def process_admin_code(message: types.Message, state: FSMContext):
 async def cmd_admin(message: types.Message, state: FSMContext):
     admin = await get_admin(message.from_user.id)
     if not admin:
+        await message.answer("Введи <b>специальный код администратора</b>:", parse_mode="HTML")
+        await state.set_state(AuthState.waiting_for_code)
         return
     await state.clear()
     await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=get_admin_inline_kb(), parse_mode="HTML")
@@ -482,7 +496,6 @@ async def process_name(message: types.Message, state: FSMContext):
             if (await cursor.fetchone())[0] > 0:
                 async with db.execute("SELECT name FROM valid_names WHERE name LIKE ?", (f"%{user_input}%",)) as c2:
                     if not await c2.fetchone():
-                        # Добавил кнопку "Назад" на случай ошибки
                         builder = InlineKeyboardBuilder()
                         builder.button(text="🔙 Назад", callback_data="role_back")
                         await message.answer("❌ <b>Ошибка:</b> Фамилия не зарегистрирована в расписании.", reply_markup=builder.as_markup(), parse_mode="HTML")
