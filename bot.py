@@ -139,7 +139,6 @@ class ChangeNameState(StatesGroup):
 class TransactionState(StatesGroup):
     waiting_for_fine = State()
     waiting_for_bonus = State()
-# 🆕 НОВЫЕ СОСТОЯНИЯ ДЛЯ СПИСКА
 class SellerListState(StatesGroup):
     waiting_for_add_name = State()
     waiting_for_remove_name = State()
@@ -555,30 +554,41 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=get_admin_inline_kb(), parse_mode="HTML")
 
+# 🆕 РЕГИСТРАЦИЯ С ДВОЙНОЙ ПРОВЕРКОЙ (Таблица + Локальная база)
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     user_input = message.text.strip()
     msg = await message.answer("⏳ Проверяю фамилию в базе...")
     
-    live_names = await fetch_live_names_from_sheet()
-    if live_names is None:
-        await msg.edit_text("❌ <b>Что-то пошло не так.</b>\nНе удалось подключиться к таблице. Попробуй позже или напиши админу.", parse_mode="HTML")
-        return
-        
     clean_input = user_input.lower()
     matched_name = None
     
-    for name_lower, name_orig in live_names.items():
-        if clean_input == name_lower or clean_input in name_lower:
-            matched_name = name_orig
-            break
+    # 1. Проверяем в живой Google-таблице
+    live_names = await fetch_live_names_from_sheet()
+    if live_names is not None:
+        for name_lower, name_orig in live_names.items():
+            if clean_input == name_lower or clean_input in name_lower:
+                matched_name = name_orig
+                break
+                
+    # 2. Если в таблице нет, проверяем в локальной базе valid_names
+    if not matched_name:
+        async with aiosqlite.connect("king_tabak.db") as db:
+            async with db.execute("SELECT name FROM valid_names") as cursor:
+                db_names = await cursor.fetchall()
+                for (db_name,) in db_names:
+                    if clean_input == db_name.lower() or clean_input in db_name.lower():
+                        matched_name = db_name
+                        break
 
+    # 3. Если нигде нет — ошибка
     if not matched_name:
         builder = InlineKeyboardBuilder()
         builder.button(text="🔙 Назад", callback_data="role_back")
         await msg.edit_text("❌ <b>Что-то пошло не так.</b>\nФамилия не найдена в расписании.", reply_markup=builder.as_markup(), parse_mode="HTML")
         return
 
+    # 4. Успех
     await msg.edit_text(f"✅ <b>Успешная регистрация!</b>\nТвоя фамилия найдена: {matched_name}")
     
     await state.update_data(name=matched_name)
@@ -772,16 +782,24 @@ async def process_change_name(message: types.Message, state: FSMContext):
     new_name = message.text.strip()
     msg = await message.answer("⏳ Проверяю фамилию в базе...")
     
-    live_names = await fetch_live_names_from_sheet()
-    if live_names is None:
-        return await msg.edit_text("❌ Ошибка доступа к таблице. Попробуй позже.")
-        
     clean_input = new_name.lower()
     matched_name = None
-    for name_lower, name_orig in live_names.items():
-        if clean_input == name_lower or clean_input in name_lower:
-            matched_name = name_orig
-            break
+    
+    live_names = await fetch_live_names_from_sheet()
+    if live_names is not None:
+        for name_lower, name_orig in live_names.items():
+            if clean_input == name_lower or clean_input in name_lower:
+                matched_name = name_orig
+                break
+                
+    if not matched_name:
+        async with aiosqlite.connect("king_tabak.db") as db:
+            async with db.execute("SELECT name FROM valid_names") as cursor:
+                db_names = await cursor.fetchall()
+                for (db_name,) in db_names:
+                    if clean_input == db_name.lower() or clean_input in db_name.lower():
+                        matched_name = db_name
+                        break
 
     if not matched_name:
         return await msg.edit_text("❌ <b>Что-то пошло не так.</b>\nФамилия не найдена в расписании.", parse_mode="HTML")
@@ -832,7 +850,6 @@ async def process_import_date(message: types.Message, state: FSMContext):
     await message.answer(msg, reply_markup=get_admin_inline_kb())
     await state.clear()
 
-# 🆕 ОБНОВЛЕННЫЙ ОБРАБОТЧИК СПИСКА ПРОДАВЦОВ
 @dp.callback_query(F.data == "adm_list_sellers")
 async def cb_adm_list_sellers(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS and not await get_admin(callback.from_user.id):
@@ -895,7 +912,6 @@ async def cb_adm_list_sellers(callback: types.CallbackQuery):
         
     await callback.answer()
 
-# 🆕 ДОБАВЛЕНИЕ ФАМИЛИИ
 @dp.callback_query(F.data == "adm_add_name")
 async def cb_adm_add_name(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Введи фамилию, которую нужно внести в список (в неавторизованные):")
@@ -911,10 +927,8 @@ async def process_add_name(message: types.Message, state: FSMContext):
     
     await message.answer(f"✅ Фамилия <b>{new_name}</b> добавлена в базу неавторизованных.", parse_mode="HTML")
     await state.clear()
-    # Перерисовываем список
     await cb_adm_list_sellers(message)
 
-# 🆕 ИСКЛЮЧЕНИЕ ФАМИЛИИ
 @dp.callback_query(F.data == "adm_remove_name")
 async def cb_adm_remove_name(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Введи фамилию, которую нужно исключить из базы:")
@@ -930,7 +944,6 @@ async def process_remove_name(message: types.Message, state: FSMContext):
     
     await message.answer(f"✅ Фамилия <b>{rem_name}</b> удалена из базы.", parse_mode="HTML")
     await state.clear()
-    # Перерисовываем список
     await cb_adm_list_sellers(message)
 
 @dp.callback_query(F.data == "adm_delete_user")
