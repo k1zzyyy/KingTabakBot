@@ -27,7 +27,6 @@ ADMIN_CODES = {
     "ZAHAR777": "Захар"
 }
 
-# 🗺️ ВСЕ КЛЮЧИ В ВЕРХНЕМ РЕГИСТРЕ. ИСПРАВЛЕНО НАЗВАНИЕ Л61КИО!
 POINTS_DATA = {
     "Л41": {"full": "Кинг Табак (Л41)", "address": "Лиговский проспект 41", "line": "Красная ветка", "station": "Площадь Восстания", "chat": "https://yandex.ru/chat/#/join/e7586022-f0c3-4f45-8e11-ebb2dc888cc1"},
     "Л43": {"full": "Кинг Табак (Л43)", "address": "Лиговский проспект 43", "line": "Красная ветка", "station": "Площадь Восстания", "chat": "https://yandex.ru/chat/#/join/df5a7902-2891-4c76-93d8-17beccd80d86"},
@@ -62,23 +61,50 @@ POINTS_DATA = {
     "К18": {"full": "Кинг Табак (Кирочная 18)", "address": "Кирочная 18", "line": "Красная ветка", "station": "Чернышевская", "chat": "https://yandex.ru/chat/#/join/827d95ed-22fd-4e4d-85fa-314b488a2402"}
 }
 
-# Умный поиск точки
 def get_point_info(query):
     query_upper = query.strip().upper()
-    
-    # 1. Прямое совпадение по коду (Н27)
-    if query_upper in POINTS_DATA:
-        return query_upper, POINTS_DATA[query_upper]
-        
-    # 2. Поиск по адресу (для инлайн-кнопок из таблицы)
+    if query_upper in POINTS_DATA: return query_upper, POINTS_DATA[query_upper]
     for key, pt in POINTS_DATA.items():
-        # Если адрес из базы (например "Лесной 61А") есть в запросе (Лесной 61А (Кио Кухня))
-        if pt["address"].upper() in query_upper:
-            return key, pt
-            
+        if pt["address"].upper() in query_upper: return key, pt
     return None, None
 
-# ... (ОСТАЛЬНОЙ КОД БЕЗ ИЗМЕНЕНИЙ ДО КОНЦА) ...
+async def fetch_live_names_from_sheet():
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(SHEET_CSV_URL) as response:
+                if response.status != 200: return None
+                text = await response.text()
+        if "<html" in text.lower(): return None
+
+        f = io.StringIO(text)
+        delimiter = ',' if text.split('\n')[0].count(',') > text.split('\n')[0].count(';') else ';'
+        rows = list(csv.reader(f, delimiter=delimiter))
+        if len(rows) < 2: return None
+
+        header_idx = -1
+        for idx, row in enumerate(rows[:10]): 
+            if any(d in " ".join(str(c).upper() for c in row) for d in ["ВТ", "СР", "ПН"]):
+                header_idx = idx; break
+        if header_idx == -1: return None
+
+        col_to_day = {i: int(''.join(filter(str.isdigit, str(cell)))) for i, cell in enumerate(rows[header_idx]) if any(c.isdigit() for c in str(cell))}
+        
+        names_dict = {}
+        for row in rows[header_idx + 1:]:
+            if len(row) < 2: continue
+            if row[0].strip(): curr_addr = row[0].strip()
+            s_type = row[1].strip().capitalize() if len(row) > 1 else ""
+            if s_type not in ("День", "Дневная", "Ночь", "Ночная"): continue 
+
+            for col in col_to_day.keys():
+                if col >= len(row): continue
+                val = row[col].strip()
+                if val and val not in ("---", "——", "—", "⬆️", "⬇️", "↑", "↓"):
+                    names_dict[val.lower()] = val
+        return names_dict
+    except Exception as e:
+        print(f"Ошибка при скачивании таблицы: {e}")
+        return None
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -113,6 +139,10 @@ class ChangeNameState(StatesGroup):
 class TransactionState(StatesGroup):
     waiting_for_fine = State()
     waiting_for_bonus = State()
+# 🆕 НОВЫЕ СОСТОЯНИЯ ДЛЯ СПИСКА
+class SellerListState(StatesGroup):
+    waiting_for_add_name = State()
+    waiting_for_remove_name = State()
 
 async def init_db():
     async with aiosqlite.connect("king_tabak.db") as db:
@@ -163,9 +193,9 @@ async def save_admin(telegram_id, name, code):
         await db.commit()
 
 async def get_user_by_name(name):
-    clean_name = str(name).strip()
+    clean_name = str(name).strip().lower()
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT telegram_id, name FROM users WHERE name LIKE ?", (f"%{clean_name}%",)) as cursor:
+        async with db.execute("SELECT telegram_id, name FROM users WHERE LOWER(name) LIKE ?", (f"%{clean_name}%",)) as cursor:
             return await cursor.fetchone()
 
 async def save_user(telegram_id, name, role):
@@ -339,20 +369,32 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
         locs = defaultdict(list)
         for s in parsed_shifts: locs[s['addr']].append(s)
 
-        notified, await_clear = set(), clear_shifts_for_month(month, year)
-        await await_clear
+        old_shifts_data = {}
+        async with aiosqlite.connect("king_tabak.db") as db:
+            async with db.execute("SELECT user_id, date, shift_type, address, replaces, replaced_by FROM shifts WHERE date LIKE ?", (f"{year}-{month:02d}-%",)) as cursor:
+                for row in await cursor.fetchall():
+                    uid = row[0]
+                    if uid not in old_shifts_data: old_shifts_data[uid] = set()
+                    old_shifts_data[uid].add(row[1:])
 
+        await clear_shifts_for_month(month, year)
+        
+        new_shifts_data = {}
         insert_data = []
         for addr, shifts in locs.items():
             shifts.sort(key=lambda x: (x['date'], 0 if "День" in x['type'] else 1)) 
             for i in range(len(shifts)):
                 if shifts[i]['user_id']:
-                    insert_data.append((
-                        shifts[i]['user_id'], shifts[i]['date'], shifts[i]['type'], shifts[i]['addr'],
+                    shift_tuple = (
+                        shifts[i]['date'], shifts[i]['type'], shifts[i]['addr'],
                         shifts[i-1]['name'] if i > 0 else "-",
                         shifts[i+1]['name'] if i < len(shifts) - 1 else "-"
-                    ))
-                    notified.add(shifts[i]['user_id'])
+                    )
+                    insert_data.append((shifts[i]['user_id'],) + shift_tuple)
+                    
+                    uid = shifts[i]['user_id']
+                    if uid not in new_shifts_data: new_shifts_data[uid] = set()
+                    new_shifts_data[uid].add(shift_tuple)
 
         if insert_data:
             async with aiosqlite.connect("king_tabak.db") as db:
@@ -363,9 +405,15 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
         await set_setting("last_loaded_month", str(month))
         await set_setting("last_loaded_year", str(year))
         
-        if notified and notify_users:
-            for uid in notified:
-                try: await bot.send_message(uid, "🔔 <b>Обновлено расписание!</b>", parse_mode="HTML")
+        if notify_users:
+            notified_users = set()
+            all_uids = set(old_shifts_data.keys()).union(set(new_shifts_data.keys()))
+            for uid in all_uids:
+                if old_shifts_data.get(uid, set()) != new_shifts_data.get(uid, set()):
+                    notified_users.add(uid)
+                    
+            for uid in notified_users:
+                try: await bot.send_message(uid, "🔔 <b>Внимание!</b> Твое расписание изменилось. Проверь смены!", parse_mode="HTML")
                 except: pass
 
         msg = f"✅ Импорт завершен! Смен: {len(insert_data)}."
@@ -418,6 +466,7 @@ def get_admin_inline_kb():
     builder.button(text="➕ Добавить смену", callback_data="adm_add_shift")
     builder.button(text="❌ Удалить смену", callback_data="adm_delete_shift")
     builder.button(text="❌ Удалить пользователя", callback_data="adm_delete_user")
+    builder.button(text="👥 Список продавцов", callback_data="adm_list_sellers") 
     builder.button(text="⚡ Авто-синхронизация", callback_data="adm_toggle_auto")
     builder.button(text="🔄 Загрузить вручную", callback_data="adm_import_gsheet")
     builder.button(text="🔙 Закрыть меню", callback_data="adm_back")
@@ -509,16 +558,30 @@ async def cmd_admin(message: types.Message, state: FSMContext):
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     user_input = message.text.strip()
-    async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT COUNT(*) FROM valid_names") as cursor:
-            if (await cursor.fetchone())[0] > 0:
-                async with db.execute("SELECT name FROM valid_names WHERE name LIKE ?", (f"%{user_input}%",)) as c2:
-                    if not await c2.fetchone():
-                        builder = InlineKeyboardBuilder()
-                        builder.button(text="🔙 Назад", callback_data="role_back")
-                        await message.answer("❌ <b>Ошибка:</b> Фамилия не зарегистрирована в расписании.", reply_markup=builder.as_markup(), parse_mode="HTML")
-                        return
-    await state.update_data(name=user_input)
+    msg = await message.answer("⏳ Проверяю фамилию в базе...")
+    
+    live_names = await fetch_live_names_from_sheet()
+    if live_names is None:
+        await msg.edit_text("❌ <b>Что-то пошло не так.</b>\nНе удалось подключиться к таблице. Попробуй позже или напиши админу.", parse_mode="HTML")
+        return
+        
+    clean_input = user_input.lower()
+    matched_name = None
+    
+    for name_lower, name_orig in live_names.items():
+        if clean_input == name_lower or clean_input in name_lower:
+            matched_name = name_orig
+            break
+
+    if not matched_name:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 Назад", callback_data="role_back")
+        await msg.edit_text("❌ <b>Что-то пошло не так.</b>\nФамилия не найдена в расписании.", reply_markup=builder.as_markup(), parse_mode="HTML")
+        return
+
+    await msg.edit_text(f"✅ <b>Успешная регистрация!</b>\nТвоя фамилия найдена: {matched_name}")
+    
+    await state.update_data(name=matched_name)
     kb = [[KeyboardButton(text="2800 ₽"), KeyboardButton(text="3100 ₽"), KeyboardButton(text="3500 ₽")]]
     await message.answer("Выбери свою ставку:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
 
@@ -707,12 +770,25 @@ async def btn_change_name(message: types.Message, state: FSMContext):
 @dp.message(ChangeNameState.waiting_for_new_name)
 async def process_change_name(message: types.Message, state: FSMContext):
     new_name = message.text.strip()
-    async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT name FROM valid_names WHERE name LIKE ?", (f"%{new_name}%",)) as cur:
-            if not await cur.fetchone(): return await message.answer("❌ Фамилия не в расписании.")
-    await update_user_name(message.from_user.id, new_name)
+    msg = await message.answer("⏳ Проверяю фамилию в базе...")
+    
+    live_names = await fetch_live_names_from_sheet()
+    if live_names is None:
+        return await msg.edit_text("❌ Ошибка доступа к таблице. Попробуй позже.")
+        
+    clean_input = new_name.lower()
+    matched_name = None
+    for name_lower, name_orig in live_names.items():
+        if clean_input == name_lower or clean_input in name_lower:
+            matched_name = name_orig
+            break
+
+    if not matched_name:
+        return await msg.edit_text("❌ <b>Что-то пошло не так.</b>\nФамилия не найдена в расписании.", parse_mode="HTML")
+
+    await update_user_name(message.from_user.id, matched_name)
     is_admin = bool(await get_admin(message.from_user.id))
-    await message.answer("✅ Фамилия изменена.", reply_markup=get_main_menu(is_admin))
+    await msg.edit_text(f"✅ Фамилия изменена на <b>{matched_name}</b>!", reply_markup=get_main_menu(is_admin), parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "adm_back")
@@ -755,6 +831,107 @@ async def process_import_date(message: types.Message, state: FSMContext):
     _, msg = await process_and_save_sheet(m, y, is_auto=False)
     await message.answer(msg, reply_markup=get_admin_inline_kb())
     await state.clear()
+
+# 🆕 ОБНОВЛЕННЫЙ ОБРАБОТЧИК СПИСКА ПРОДАВЦОВ
+@dp.callback_query(F.data == "adm_list_sellers")
+async def cb_adm_list_sellers(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and not await get_admin(callback.from_user.id):
+        await callback.answer("Нет прав.", show_alert=True)
+        return
+        
+    async with aiosqlite.connect("king_tabak.db") as db:
+        async with db.execute("SELECT name FROM valid_names") as cursor:
+            all_names = [row[0] for row in await cursor.fetchall()]
+            
+        async with db.execute("SELECT name FROM users") as cursor:
+            registered_users = [row[0].lower() for row in await cursor.fetchall()]
+            
+    if not all_names:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="➕ Внести фамилию", callback_data="adm_add_name")
+        builder.button(text="🔙 Назад", callback_data="admin_panel")
+        await callback.message.edit_text("Список пуст. Сначала загрузите расписание или добавьте вручную.", reply_markup=builder.as_markup())
+        return
+
+    reg_names = []
+    unreg_names = []
+    
+    for name in all_names:
+        is_reg = any(name.lower() in reg or reg in name.lower() for reg in registered_users)
+        if is_reg:
+            reg_names.append(name)
+        else:
+            unreg_names.append(name)
+            
+    reg_names.sort()
+    unreg_names.sort()
+    
+    text = "👥 <b>Список продавцов:</b>\n\n"
+    if reg_names:
+        text += "<b>✅ Зарегистрированы:</b>\n"
+        for name in reg_names:
+            text += f"• {name}\n"
+        text += "\n"
+    
+    if unreg_names:
+        text += "<b>❌ Не зарегистрированы:</b>\n"
+        for name in unreg_names:
+            text += f"• {name}\n"
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Внести фамилию", callback_data="adm_add_name")
+    builder.button(text="➖ Исключить фамилию", callback_data="adm_remove_name")
+    builder.button(text="🔙 Назад", callback_data="admin_panel")
+    builder.adjust(2, 1)
+
+    if len(text) > 4000:
+        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for part in parts:
+            await callback.message.answer(part, parse_mode="HTML")
+        await callback.message.answer("Управление списком:", reply_markup=builder.as_markup())
+        await callback.message.delete()
+    else:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+        
+    await callback.answer()
+
+# 🆕 ДОБАВЛЕНИЕ ФАМИЛИИ
+@dp.callback_query(F.data == "adm_add_name")
+async def cb_adm_add_name(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введи фамилию, которую нужно внести в список (в неавторизованные):")
+    await state.set_state(SellerListState.waiting_for_add_name)
+    await callback.answer()
+
+@dp.message(SellerListState.waiting_for_add_name)
+async def process_add_name(message: types.Message, state: FSMContext):
+    new_name = message.text.strip()
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute("INSERT OR IGNORE INTO valid_names (name) VALUES (?)", (new_name,))
+        await db.commit()
+    
+    await message.answer(f"✅ Фамилия <b>{new_name}</b> добавлена в базу неавторизованных.", parse_mode="HTML")
+    await state.clear()
+    # Перерисовываем список
+    await cb_adm_list_sellers(message)
+
+# 🆕 ИСКЛЮЧЕНИЕ ФАМИЛИИ
+@dp.callback_query(F.data == "adm_remove_name")
+async def cb_adm_remove_name(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введи фамилию, которую нужно исключить из базы:")
+    await state.set_state(SellerListState.waiting_for_remove_name)
+    await callback.answer()
+
+@dp.message(SellerListState.waiting_for_remove_name)
+async def process_remove_name(message: types.Message, state: FSMContext):
+    rem_name = message.text.strip()
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute("DELETE FROM valid_names WHERE LOWER(name) LIKE ?", (f"%{rem_name.lower()}%",))
+        await db.commit()
+    
+    await message.answer(f"✅ Фамилия <b>{rem_name}</b> удалена из базы.", parse_mode="HTML")
+    await state.clear()
+    # Перерисовываем список
+    await cb_adm_list_sellers(message)
 
 @dp.callback_query(F.data == "adm_delete_user")
 async def cb_adm_del_user(callback: types.CallbackQuery, state: FSMContext):
