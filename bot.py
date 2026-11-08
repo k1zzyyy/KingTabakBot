@@ -98,8 +98,8 @@ async def fetch_live_names_from_sheet():
 
             for col in col_to_day.keys():
                 if col >= len(row): continue
-                val = row[col].strip()
-                if val and val not in ("---", "——", "—", "⬆️", "⬇️", "↑", "↓"):
+                val = row[col].strip().replace('\xa0', ' ')
+                if val and val not in ("⬆️", "⬇️", "↑", "↓") and not set(val).issubset({'-', '—', ' '}):
                     names_dict[val.lower()] = val
         return names_dict
     except Exception as e:
@@ -192,10 +192,14 @@ async def save_admin(telegram_id, name, code):
         await db.commit()
 
 async def get_user_by_name(name):
-    clean_name = str(name).strip().lower()
+    clean_name = str(name).strip().replace('\xa0', ' ').lower()
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT telegram_id, name FROM users WHERE LOWER(name) LIKE ?", (f"%{clean_name}%",)) as cursor:
-            return await cursor.fetchone()
+        async with db.execute("SELECT telegram_id, name FROM users") as cursor:
+            all_users = await cursor.fetchall()
+            for uid, db_name in all_users:
+                if clean_name in db_name.lower():
+                    return (uid, db_name)
+            return None
 
 async def save_user(telegram_id, name, role):
     async with aiosqlite.connect("king_tabak.db") as db:
@@ -343,6 +347,11 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
         parsed_shifts, missing_names, all_names = [], set(), set()
         curr_addr = ""
         
+        async with aiosqlite.connect("king_tabak.db") as db:
+            async with db.execute("SELECT telegram_id, name FROM users") as cursor:
+                all_users_db = await cursor.fetchall()
+                users_dict = {db_name.lower().strip(): (uid, db_name) for uid, db_name in all_users_db}
+
         for row in rows[header_idx + 1:]:
             if len(row) < 2: continue
             if row[0].strip(): curr_addr = row[0].strip()
@@ -351,13 +360,24 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
 
             for col, day in col_to_day.items():
                 if col >= len(row): continue
-                val = row[col].strip()
-                if val and val not in ("---", "——", "—", "⬆️", "⬇️", "↑", "↓"):
+                val = row[col].strip().replace('\xa0', ' ')
+                if val and val not in ("⬆️", "⬇️", "↑", "↓") and not set(val).issubset({'-', '—', ' '}):
                     all_names.add(val)
-                    user = await get_user_by_name(val)
-                    if not user: missing_names.add(val)
+                    clean_val = val.lower()
+                    user_info = None
+                    for db_lower, u_info in users_dict.items():
+                        if db_lower in clean_val or clean_val in db_lower:
+                            user_info = u_info
+                            break
+                    if not user_info: missing_names.add(val)
                     try:
-                        parsed_shifts.append({'user_id': user[0] if user else None, 'name': val, 'date': datetime(year, month, day).strftime("%Y-%m-%d"), 'type': s_type, 'addr': curr_addr})
+                        parsed_shifts.append({
+                            'user_id': user_info[0] if user_info else None, 
+                            'name': val, 
+                            'date': datetime(year, month, day).strftime("%Y-%m-%d"), 
+                            'type': s_type, 
+                            'addr': curr_addr
+                        })
                     except: pass
 
         if all_names:
@@ -368,16 +388,6 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
         locs = defaultdict(list)
         for s in parsed_shifts: locs[s['addr']].append(s)
 
-        old_shifts_data = {}
-        async with aiosqlite.connect("king_tabak.db") as db:
-            async with db.execute("SELECT user_id, date, shift_type, address, replaces, replaced_by FROM shifts WHERE date LIKE ?", (f"{year}-{month:02d}-%",)) as cursor:
-                for row in await cursor.fetchall():
-                    uid = row[0]
-                    if uid not in old_shifts_data: old_shifts_data[uid] = set()
-                    old_shifts_data[uid].add(row[1:])
-
-        await clear_shifts_for_month(month, year)
-        
         new_shifts_data = {}
         insert_data = []
         for addr, shifts in locs.items():
@@ -390,15 +400,26 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
                         shifts[i+1]['name'] if i < len(shifts) - 1 else "-"
                     )
                     insert_data.append((shifts[i]['user_id'],) + shift_tuple)
-                    
                     uid = shifts[i]['user_id']
                     if uid not in new_shifts_data: new_shifts_data[uid] = set()
                     new_shifts_data[uid].add(shift_tuple)
 
-        if insert_data:
-            async with aiosqlite.connect("king_tabak.db") as db:
-                await db.executemany("INSERT INTO shifts (user_id, date, shift_type, address, replaces, replaced_by) VALUES (?, ?, ?, ?, ?, ?)", insert_data)
-                await db.commit()
+        if not insert_data:
+            return False, "❌ Импорт отменен: не найдено ни одной смены для зарегистрированных пользователей.\n\nСмены за этот месяц НЕ удалены."
+
+        old_shifts_data = {}
+        async with aiosqlite.connect("king_tabak.db") as db:
+            async with db.execute("SELECT user_id, date, shift_type, address, replaces, replaced_by FROM shifts WHERE date LIKE ?", (f"{year}-{month:02d}-%",)) as cursor:
+                for row in await cursor.fetchall():
+                    uid = row[0]
+                    if uid not in old_shifts_data: old_shifts_data[uid] = set()
+                    old_shifts_data[uid].add(row[1:])
+
+        await clear_shifts_for_month(month, year)
+        
+        async with aiosqlite.connect("king_tabak.db") as db:
+            await db.executemany("INSERT INTO shifts (user_id, date, shift_type, address, replaces, replaced_by) VALUES (?, ?, ?, ?, ?, ?)", insert_data)
+            await db.commit()
 
         await set_setting("last_sheet_hash", current_hash)
         await set_setting("last_loaded_month", str(month))
@@ -475,7 +496,6 @@ def get_admin_inline_kb():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    
     user = await get_user(message.from_user.id)
     if user:
         name, role = user
@@ -554,16 +574,14 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=get_admin_inline_kb(), parse_mode="HTML")
 
-# 🆕 РЕГИСТРАЦИЯ С ДВОЙНОЙ ПРОВЕРКОЙ (Таблица + Локальная база)
 @dp.message(RegState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
-    user_input = message.text.strip()
+    user_input = message.text.strip().replace('\xa0', ' ')
     msg = await message.answer("⏳ Проверяю фамилию в базе...")
     
     clean_input = user_input.lower()
     matched_name = None
     
-    # 1. Проверяем в живой Google-таблице
     live_names = await fetch_live_names_from_sheet()
     if live_names is not None:
         for name_lower, name_orig in live_names.items():
@@ -571,7 +589,6 @@ async def process_name(message: types.Message, state: FSMContext):
                 matched_name = name_orig
                 break
                 
-    # 2. Если в таблице нет, проверяем в локальной базе valid_names
     if not matched_name:
         async with aiosqlite.connect("king_tabak.db") as db:
             async with db.execute("SELECT name FROM valid_names") as cursor:
@@ -581,14 +598,12 @@ async def process_name(message: types.Message, state: FSMContext):
                         matched_name = db_name
                         break
 
-    # 3. Если нигде нет — ошибка
     if not matched_name:
         builder = InlineKeyboardBuilder()
         builder.button(text="🔙 Назад", callback_data="role_back")
         await msg.edit_text("❌ <b>Что-то пошло не так.</b>\nФамилия не найдена в расписании.", reply_markup=builder.as_markup(), parse_mode="HTML")
         return
 
-    # 4. Успех
     await msg.edit_text(f"✅ <b>Успешная регистрация!</b>\nТвоя фамилия найдена: {matched_name}")
     
     await state.update_data(name=matched_name)
@@ -628,7 +643,7 @@ async def process_point_query(message: types.Message, state: FSMContext):
     is_admin = bool(await get_admin(message.from_user.id))
     if not is_admin: return
     
-    query = message.text.strip()
+    query = message.text.strip().replace('\xa0', ' ')
     key, pt = get_point_info(query)
     
     if pt:
@@ -694,7 +709,7 @@ async def cb_point_info(callback: types.CallbackQuery):
         await callback.answer("У вас нет прав для просмотра этой информации.", show_alert=True)
         return
         
-    query = callback.data.replace("point_info_", "").strip()
+    query = callback.data.replace("point_info_", "").strip().replace('\xa0', ' ')
     key, pt = get_point_info(query)
     
     if pt:
@@ -779,7 +794,7 @@ async def btn_change_name(message: types.Message, state: FSMContext):
 
 @dp.message(ChangeNameState.waiting_for_new_name)
 async def process_change_name(message: types.Message, state: FSMContext):
-    new_name = message.text.strip()
+    new_name = message.text.strip().replace('\xa0', ' ')
     msg = await message.answer("⏳ Проверяю фамилию в базе...")
     
     clean_input = new_name.lower()
@@ -920,7 +935,7 @@ async def cb_adm_add_name(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(SellerListState.waiting_for_add_name)
 async def process_add_name(message: types.Message, state: FSMContext):
-    new_name = message.text.strip()
+    new_name = message.text.strip().replace('\xa0', ' ')
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("INSERT OR IGNORE INTO valid_names (name) VALUES (?)", (new_name,))
         await db.commit()
@@ -937,7 +952,7 @@ async def cb_adm_remove_name(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(SellerListState.waiting_for_remove_name)
 async def process_remove_name(message: types.Message, state: FSMContext):
-    rem_name = message.text.strip()
+    rem_name = message.text.strip().replace('\xa0', ' ')
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("DELETE FROM valid_names WHERE LOWER(name) LIKE ?", (f"%{rem_name.lower()}%",))
         await db.commit()
