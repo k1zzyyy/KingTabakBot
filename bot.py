@@ -107,7 +107,7 @@ async def fetch_live_names_from_sheet():
         print(f"Ошибка при скачивании таблицы: {e}")
         return None
 
-# 🆕 ФУНКЦИЯ ДЛЯ ПОИСКА СВОБОДНЫХ СМЕН
+# 🆕 ОБНОВЛЕННЫЙ ПОИСК СВОБОДНЫХ СМЕН (Убрана стрелка, добавлена защита от прочерков)
 async def get_free_slots_from_sheet(month, year):
     try:
         async with aiohttp.ClientSession() as session:
@@ -135,7 +135,11 @@ async def get_free_slots_from_sheet(month, year):
         
         for row in rows[header_idx + 1:]:
             if len(row) < 2: continue
-            if row[0].strip(): curr_addr = row[0].strip()
+            
+            # Очищаем название точки от стрелок, пробелов и прочего мусора
+            if row[0].strip(): 
+                curr_addr = row[0].strip().replace('➡️', '').replace('⬆️', '').replace('⬇️', '').replace('→', '').replace('←', '').strip()
+                
             s_type = row[1].strip().capitalize() if len(row) > 1 else ""
             if s_type not in ("День", "Дневная", "Ночь", "Ночная"): continue 
             
@@ -145,8 +149,8 @@ async def get_free_slots_from_sheet(month, year):
                 if col >= len(row): continue
                 val = row[col].strip().replace('\xa0', ' ')
                 
-                # Если ячейка пустая или содержит только прочерки - это свободный слот
-                if not val or set(val).issubset({'-', '—', ' ', ''}):
+                # Считаем слот свободным ТОЛЬКО если ячейка полностью пустая
+                if not val:
                     try:
                         m_date = datetime(year, month, day).date()
                         if m_date < today_date:
@@ -161,7 +165,6 @@ async def get_free_slots_from_sheet(month, year):
         print(f"Error in get_free_slots: {e}")
         return None
 
-# 🆕 ФУНКЦИЯ ДЛЯ ТОП-3
 async def send_top_3():
     m_str, y_str = await get_setting("last_loaded_month"), await get_setting("last_loaded_year")
     if not m_str or not y_str: return
@@ -427,7 +430,6 @@ async def shift_reminders_worker():
                 except: pass
         await asyncio.sleep(60)
 
-# 🆕 ВОРКЕР ДЛЯ ТОП-3
 async def top_3_worker():
     while True:
         now = datetime.now(MOSCOW_TZ)
@@ -486,7 +488,11 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
 
         for row in rows[header_idx + 1:]:
             if len(row) < 2: continue
-            if row[0].strip(): curr_addr = row[0].strip()
+            
+            # Очищаем адрес от мусора
+            if row[0].strip(): 
+                curr_addr = row[0].strip().replace('➡️', '').replace('⬆️', '').replace('⬇️', '').replace('→', '').replace('←', '').strip()
+
             s_type = row[1].strip().capitalize() if len(row) > 1 else ""
             if s_type not in ("День", "Дневная", "Ночь", "Ночная"): continue 
 
@@ -585,7 +591,7 @@ def get_main_menu(is_admin=False):
     kb = [
         [KeyboardButton(text="📅 Мои смены"), KeyboardButton(text="⏰ Ближайшая смена")],
         [KeyboardButton(text="💰 Зарплата"), KeyboardButton(text="👤 Личный кабинет")],
-        [KeyboardButton(text="🚨 Свободные смены")] # НОВАЯ КНОПКА
+        [KeyboardButton(text="🚨 Свободные смены")]
     ]
     if is_admin:
         kb.append([KeyboardButton(text="🗺 Точки")])
@@ -763,7 +769,6 @@ async def cmd_back_to_main(message: types.Message, state: FSMContext):
     is_admin = bool(await get_admin(message.from_user.id))
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
 
-# 🆕 ОБРАБОТЧИК КНОПКИ СВОБОДНЫХ СМЕН
 @dp.message(F.text == "🚨 Свободные смены")
 async def btn_free_shifts(message: types.Message):
     m_str, y_str = await get_setting("last_loaded_month"), await get_setting("last_loaded_year")
@@ -778,7 +783,6 @@ async def btn_free_shifts(message: types.Message):
         return await msg.edit_text("Не удалось загрузить данные из таблицы. Попробуй позже.")
         
     text = ""
-    # Сортируем даты по порядку (день, месяц)
     sorted_dates = sorted(free_slots.keys(), key=lambda d: (int(d.split('.')[1]), int(d.split('.')[0])))
     
     for date_str in sorted_dates:
@@ -1235,7 +1239,7 @@ async def main():
     asyncio.create_task(auto_sync_worker())
     asyncio.create_task(daily_closing_reminder_worker())
     asyncio.create_task(shift_reminders_worker())
-    asyncio.create_task(top_3_worker()) # Запуск топа
+    asyncio.create_task(top_3_worker())
     print("Бот запущен...", flush=True)
     await dp.start_polling(bot)
 
