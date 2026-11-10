@@ -5,6 +5,7 @@ import csv
 import io
 import aiohttp
 import hashlib
+import calendar
 from datetime import date, datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -105,6 +106,112 @@ async def fetch_live_names_from_sheet():
     except Exception as e:
         print(f"Ошибка при скачивании таблицы: {e}")
         return None
+
+# 🆕 ФУНКЦИЯ ДЛЯ ПОИСКА СВОБОДНЫХ СМЕН
+async def get_free_slots_from_sheet(month, year):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(SHEET_CSV_URL) as response:
+                if response.status != 200: return None
+                text = await response.text()
+        if "<html" in text.lower(): return None
+
+        f = io.StringIO(text)
+        delimiter = ',' if text.split('\n')[0].count(',') > text.split('\n')[0].count(';') else ';'
+        rows = list(csv.reader(f, delimiter=delimiter))
+        if len(rows) < 2: return None
+
+        header_idx = -1
+        for idx, row in enumerate(rows[:10]): 
+            if any(d in " ".join(str(c).upper() for c in row) for d in ["ВТ", "СР", "ПН"]):
+                header_idx = idx; break
+        if header_idx == -1: return None
+
+        col_to_day = {i: int(''.join(filter(str.isdigit, str(cell)))) for i, cell in enumerate(rows[header_idx]) if any(c.isdigit() for c in str(cell))}
+        
+        free_slots = defaultdict(lambda: {"День": [], "Ночь": []})
+        today_date = date.today()
+        curr_addr = ""
+        
+        for row in rows[header_idx + 1:]:
+            if len(row) < 2: continue
+            if row[0].strip(): curr_addr = row[0].strip()
+            s_type = row[1].strip().capitalize() if len(row) > 1 else ""
+            if s_type not in ("День", "Дневная", "Ночь", "Ночная"): continue 
+            
+            shift_type = "День" if "День" in s_type else "Ночь"
+
+            for col, day in col_to_day.items():
+                if col >= len(row): continue
+                val = row[col].strip().replace('\xa0', ' ')
+                
+                # Если ячейка пустая или содержит только прочерки - это свободный слот
+                if not val or set(val).issubset({'-', '—', ' ', ''}):
+                    try:
+                        m_date = datetime(year, month, day).date()
+                        if m_date < today_date:
+                            continue # Пропускаем прошедшие даты
+                            
+                        date_str = m_date.strftime("%d.%m")
+                        free_slots[date_str][shift_type].append(curr_addr)
+                    except: pass
+                    
+        return free_slots
+    except Exception as e:
+        print(f"Error in get_free_slots: {e}")
+        return None
+
+# 🆕 ФУНКЦИЯ ДЛЯ ТОП-3
+async def send_top_3():
+    m_str, y_str = await get_setting("last_loaded_month"), await get_setting("last_loaded_year")
+    if not m_str or not y_str: return
+    month, year = int(m_str), int(y_str)
+    month_name = MONTHS_RU.get(month, str(month))
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(SHEET_CSV_URL) as response:
+                if response.status != 200: return
+                text = await response.text()
+                
+        f = io.StringIO(text)
+        delimiter = ',' if text.split('\n')[0].count(',') > text.split('\n')[0].count(';') else ';'
+        rows = list(csv.reader(f, delimiter=delimiter))
+        
+        header_idx = -1
+        for idx, row in enumerate(rows[:10]): 
+            if any(d in " ".join(str(c).upper() for c in row) for d in ["ВТ", "СР", "ПН"]):
+                header_idx = idx; break
+                
+        col_to_day = {i: int(''.join(filter(str.isdigit, str(cell)))) for i, cell in enumerate(rows[header_idx]) if any(c.isdigit() for c in str(cell))}
+        
+        counts = defaultdict(int)
+        for row in rows[header_idx + 1:]:
+            if len(row) < 2: continue
+            for col in col_to_day.keys():
+                if col >= len(row): continue
+                val = row[col].strip().replace('\xa0', ' ')
+                if val and val not in ("⬆️", "⬇️", "↑", "↓") and not set(val).issubset({'-', '—', ' '}):
+                    counts[val] += 1
+                    
+        top_3 = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        msg_text = f"🏆 <b>Топ 3 продавца за {month_name}:</b>\n\n"
+        for name, count in top_3:
+            msg_text += f"{name} - {count}\n"
+            
+        async with aiosqlite.connect("king_tabak.db") as db:
+            async with db.execute("SELECT telegram_id FROM users") as cursor:
+                users = await cursor.fetchall()
+                
+        for (uid,) in users:
+            try:
+                await bot.send_message(uid, msg_text, parse_mode="HTML")
+                await asyncio.sleep(0.1)
+            except: pass
+            
+    except Exception as e:
+        print(f"Error in send_top_3: {e}")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -320,6 +427,31 @@ async def shift_reminders_worker():
                 except: pass
         await asyncio.sleep(60)
 
+# 🆕 ВОРКЕР ДЛЯ ТОП-3
+async def top_3_worker():
+    while True:
+        now = datetime.now(MOSCOW_TZ)
+        last_day = calendar.monthrange(now.year, now.month)[1]
+        target_datetime = datetime(now.year, now.month, last_day, 18, 0, 0, tzinfo=MOSCOW_TZ)
+        
+        if now >= target_datetime:
+            if now.month == 12:
+                next_m, next_y = 1, now.year + 1
+            else:
+                next_m, next_y = now.month + 1, now.year
+            last_day_next = calendar.monthrange(next_y, next_m)[1]
+            target_datetime = datetime(next_y, next_m, last_day_next, 18, 0, 0, tzinfo=MOSCOW_TZ)
+            
+        seconds_until = (target_datetime - now).total_seconds()
+        await asyncio.sleep(seconds_until)
+        
+        try:
+            await send_top_3()
+        except Exception as e:
+            print(f"Top 3 Error: {e}")
+            
+        await asyncio.sleep(86400)
+
 async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
     try:
         async with aiohttp.ClientSession() as session:
@@ -452,7 +584,8 @@ async def auto_sync_worker():
 def get_main_menu(is_admin=False):
     kb = [
         [KeyboardButton(text="📅 Мои смены"), KeyboardButton(text="⏰ Ближайшая смена")],
-        [KeyboardButton(text="💰 Зарплата"), KeyboardButton(text="👤 Личный кабинет")]
+        [KeyboardButton(text="💰 Зарплата"), KeyboardButton(text="👤 Личный кабинет")],
+        [KeyboardButton(text="🚨 Свободные смены")] # НОВАЯ КНОПКА
     ]
     if is_admin:
         kb.append([KeyboardButton(text="🗺 Точки")])
@@ -629,6 +762,40 @@ async def cmd_back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     is_admin = bool(await get_admin(message.from_user.id))
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin))
+
+# 🆕 ОБРАБОТЧИК КНОПКИ СВОБОДНЫХ СМЕН
+@dp.message(F.text == "🚨 Свободные смены")
+async def btn_free_shifts(message: types.Message):
+    m_str, y_str = await get_setting("last_loaded_month"), await get_setting("last_loaded_year")
+    if not m_str or not y_str:
+        return await message.answer("Расписание еще не загружено.")
+        
+    month, year = int(m_str), int(y_str)
+    msg = await message.answer("⏳ Ищу свободные смены...")
+    
+    free_slots = await get_free_slots_from_sheet(month, year)
+    if not free_slots:
+        return await msg.edit_text("Не удалось загрузить данные из таблицы. Попробуй позже.")
+        
+    text = ""
+    # Сортируем даты по порядку (день, месяц)
+    sorted_dates = sorted(free_slots.keys(), key=lambda d: (int(d.split('.')[1]), int(d.split('.')[0])))
+    
+    for date_str in sorted_dates:
+        day_slots = free_slots[date_str]["День"]
+        night_slots = free_slots[date_str]["Ночь"]
+        
+        if not day_slots and not night_slots:
+            continue
+            
+        text += f"<b>{date_str}</b>\n"
+        text += f"<b>День</b> - {', '.join(day_slots)}\n"
+        text += f"<b>Ночь</b> - {', '.join(night_slots)}\n\n"
+        
+    if not text:
+        await msg.edit_text("Свободных смен на оставшиеся дни нет.")
+    else:
+        await msg.edit_text(text, parse_mode="HTML")
 
 @dp.message(F.text == "🗺 Точки")
 async def btn_points(message: types.Message, state: FSMContext):
@@ -1068,6 +1235,7 @@ async def main():
     asyncio.create_task(auto_sync_worker())
     asyncio.create_task(daily_closing_reminder_worker())
     asyncio.create_task(shift_reminders_worker())
+    asyncio.create_task(top_3_worker()) # Запуск топа
     print("Бот запущен...", flush=True)
     await dp.start_polling(bot)
 
