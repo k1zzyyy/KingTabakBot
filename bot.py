@@ -107,7 +107,6 @@ async def fetch_live_names_from_sheet():
         print(f"Ошибка при скачивании таблицы: {e}")
         return None
 
-# 🆕 ОБНОВЛЕННЫЙ ПОИСК СВОБОДНЫХ СМЕН (Убрана стрелка, добавлена защита от прочерков)
 async def get_free_slots_from_sheet(month, year):
     try:
         async with aiohttp.ClientSession() as session:
@@ -136,7 +135,6 @@ async def get_free_slots_from_sheet(month, year):
         for row in rows[header_idx + 1:]:
             if len(row) < 2: continue
             
-            # Очищаем название точки от стрелок, пробелов и прочего мусора
             if row[0].strip(): 
                 curr_addr = row[0].strip().replace('➡️', '').replace('⬆️', '').replace('⬇️', '').replace('→', '').replace('←', '').strip()
                 
@@ -149,12 +147,11 @@ async def get_free_slots_from_sheet(month, year):
                 if col >= len(row): continue
                 val = row[col].strip().replace('\xa0', ' ')
                 
-                # Считаем слот свободным ТОЛЬКО если ячейка полностью пустая
                 if not val:
                     try:
                         m_date = datetime(year, month, day).date()
                         if m_date < today_date:
-                            continue # Пропускаем прошедшие даты
+                            continue 
                             
                         date_str = m_date.strftime("%d.%m")
                         free_slots[date_str][shift_type].append(curr_addr)
@@ -256,6 +253,12 @@ class SellerListState(StatesGroup):
 async def init_db():
     async with aiosqlite.connect("king_tabak.db") as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, name TEXT, role TEXT)")
+        # 🆕 Добавление колонки статуса, если ее нет
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'user'")
+        except aiosqlite.OperationalError:
+            pass # Колонка уже существует
+            
         await db.execute("CREATE TABLE IF NOT EXISTS admins (telegram_id INTEGER PRIMARY KEY, name TEXT, code TEXT UNIQUE)")
         await db.execute("CREATE TABLE IF NOT EXISTS shifts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, date TEXT, shift_type TEXT, address TEXT, replaces TEXT, replaced_by TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, type TEXT, amount INTEGER, date TEXT)")
@@ -281,9 +284,10 @@ async def get_schedule_text():
         except ValueError: return "неизвестно"
     return "пока не загружено"
 
+# 🆕 Обновлена функция получения юзера (добавлен status)
 async def get_user(telegram_id):
     async with aiosqlite.connect("king_tabak.db") as db:
-        async with db.execute("SELECT name, role FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
+        async with db.execute("SELECT name, role, status FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
             return await cursor.fetchone()
 
 async def get_admin(telegram_id):
@@ -312,8 +316,9 @@ async def get_user_by_name(name):
             return None
 
 async def save_user(telegram_id, name, role):
+    # При регистрации статус по умолчанию 'user'
     async with aiosqlite.connect("king_tabak.db") as db:
-        await db.execute("INSERT OR REPLACE INTO users (telegram_id, name, role) VALUES (?, ?, ?)", (telegram_id, name, role))
+        await db.execute("INSERT OR REPLACE INTO users (telegram_id, name, role, status) VALUES (?, ?, ?, 'user')", (telegram_id, name, role))
         await db.commit()
 
 async def update_user_role(telegram_id, new_role):
@@ -336,6 +341,18 @@ async def get_all_users():
     async with aiosqlite.connect("king_tabak.db") as db:
         async with db.execute("SELECT telegram_id, name, role FROM users") as cursor:
             return await cursor.fetchall()
+
+# 🆕 Получение только неподтвержденных пользователей
+async def get_unapproved_users():
+    async with aiosqlite.connect("king_tabak.db") as db:
+        async with db.execute("SELECT telegram_id, name FROM users WHERE status = 'user'") as cursor:
+            return await cursor.fetchall()
+
+# 🆕 Обновление статуса на 'seller'
+async def approve_user_status(telegram_id):
+    async with aiosqlite.connect("king_tabak.db") as db:
+        await db.execute("UPDATE users SET status = 'seller' WHERE telegram_id = ?", (telegram_id,))
+        await db.commit()
 
 async def get_next_shift(user_id):
     now = datetime.now(MOSCOW_TZ)
@@ -488,8 +505,6 @@ async def process_and_save_sheet(month, year, is_auto=False, notify_users=True):
 
         for row in rows[header_idx + 1:]:
             if len(row) < 2: continue
-            
-            # Очищаем адрес от мусора
             if row[0].strip(): 
                 curr_addr = row[0].strip().replace('➡️', '').replace('⬆️', '').replace('⬇️', '').replace('→', '').replace('←', '').strip()
 
@@ -591,10 +606,8 @@ def get_main_menu(is_admin=False):
     kb = [
         [KeyboardButton(text="📅 Мои смены"), KeyboardButton(text="⏰ Ближайшая смена")],
         [KeyboardButton(text="💰 Зарплата"), KeyboardButton(text="👤 Личный кабинет")],
-        [KeyboardButton(text="🚨 Свободные смены")]
+        [KeyboardButton(text="🚨 Свободные смены"), KeyboardButton(text="🗺 Точки")] # Точки для всех!
     ]
-    if is_admin:
-        kb.append([KeyboardButton(text="🗺 Точки")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, is_persistent=True)
 
 def get_salary_menu():
@@ -615,7 +628,7 @@ def get_cancel_point_menu():
 
 def get_start_inline_kb():
     builder = InlineKeyboardBuilder()
-    builder.button(text="👤 Продавец", callback_data="role_seller")
+    builder.button(text="👤 Пользователь", callback_data="role_seller") # Переименовал для UX
     builder.button(text="👑 Админ", callback_data="role_admin")
     builder.adjust(2)
     return builder.as_markup()
@@ -626,6 +639,7 @@ def get_admin_inline_kb():
     builder.button(text="❌ Удалить смену", callback_data="adm_delete_shift")
     builder.button(text="❌ Удалить пользователя", callback_data="adm_delete_user")
     builder.button(text="👥 Список продавцов", callback_data="adm_list_sellers") 
+    builder.button(text="✅ Утвердить продавца", callback_data="adm_approve_seller") # НОВАЯ КНОПКА
     builder.button(text="⚡ Авто-синхронизация", callback_data="adm_toggle_auto")
     builder.button(text="🔄 Загрузить вручную", callback_data="adm_import_gsheet")
     builder.button(text="🔙 Закрыть меню", callback_data="adm_back")
@@ -637,7 +651,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user = await get_user(message.from_user.id)
     if user:
-        name, role = user
+        name, role, status = user
         try: rate_val = int(role)
         except: rate_val = 0
         is_admin = bool(await get_admin(message.from_user.id))
@@ -755,7 +769,7 @@ async def process_role(message: types.Message, state: FSMContext):
     role = message.text.replace(" ₽", "")
     user_data = await state.get_data()
     name = user_data.get("name")
-    await save_user(message.from_user.id, name, role)
+    await save_user(message.from_user.id, name, role) # Тут статус станет 'user'
     m, y = await get_setting("last_loaded_month"), await get_setting("last_loaded_year")
     if m and y:
         await message.answer("⏳ Подгружаю смены...")
@@ -801,19 +815,36 @@ async def btn_free_shifts(message: types.Message):
     else:
         await msg.edit_text(text, parse_mode="HTML")
 
+# 🆕 ОБНОВЛЕННЫЙ ОБРАБОТЧИК ТОЧЕК (С ПРОВЕРКОЙ СТАТУСА)
 @dp.message(F.text == "🗺 Точки")
 async def btn_points(message: types.Message, state: FSMContext):
     is_admin = bool(await get_admin(message.from_user.id))
-    if not is_admin: return 
-    
-    await message.answer("Введи сокращенное название точки (например: Н27, Л44):", reply_markup=get_cancel_point_menu())
-    await state.set_state(PointState.waiting_for_query)
+    if is_admin:
+        await message.answer("Введи сокращенное название точки (например: Н27, Л44):", reply_markup=get_cancel_point_menu())
+        await state.set_state(PointState.waiting_for_query)
+        return
+        
+    user = await get_user(message.from_user.id)
+    if user:
+        name, role, status = user
+        if status == 'seller':
+            await message.answer("Введи сокращенное название точки (например: Н27, Л44):", reply_markup=get_cancel_point_menu())
+            await state.set_state(PointState.waiting_for_query)
+            return
+            
+    # Если это обычный user или его нет в базе
+    await message.answer("Для просмотра точек необходимо подтверждение. Для подтверждения отпишите в лс Захару Мерзлякову в Яндекс Телемосте")
 
 @dp.message(PointState.waiting_for_query)
 async def process_point_query(message: types.Message, state: FSMContext):
+    # Двойная проверка на всякий случай
     is_admin = bool(await get_admin(message.from_user.id))
-    if not is_admin: return
-    
+    user = await get_user(message.from_user.id)
+    if not is_admin and (not user or user[2] != 'seller'):
+        await message.answer("У вас нет прав для просмотра этой информации.")
+        await state.clear()
+        return
+
     query = message.text.strip().replace('\xa0', ' ')
     key, pt = get_point_info(query)
     
@@ -824,7 +855,7 @@ async def process_point_query(message: types.Message, state: FSMContext):
                 f"🚇 <b>Ветка:</b> {pt['line']}\n"
                 f"🚉 <b>Станция:</b> {pt['station']}\n"
                 f"💬 <b>Чат:</b> {pt['chat']}")
-        await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu(True))
+        await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu(is_admin))
     else:
         await message.answer(f"❌ Точка <b>{query}</b> не найдена в базе. Проверь название.", parse_mode="HTML")
         
@@ -865,20 +896,19 @@ async def btn_next_shift(message: types.Message):
     date_str, s_type, addr, repl, repl_by = shift
     text = (f"⏰ <b>Ближайшая смена:</b>\n\n📆 {date_str}\n🕒 {s_type}\n📍 {addr}\n🔄 Сменяешь: {repl}\n👤 Сменяет: {repl_by}")
     
-    is_admin = bool(await get_admin(message.from_user.id))
-    if is_admin:
-        builder = InlineKeyboardBuilder()
-        builder.button(text="🗺 Инфо о точке", callback_data=f"point_info_{addr}")
-        await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    else:
-        await message.answer(text, parse_mode="HTML")
+    # Инлайн кнопка для всех, но обработчик проверит права
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗺 Инфо о точке", callback_data=f"point_info_{addr}")
+    await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("point_info_"))
 async def cb_point_info(callback: types.CallbackQuery):
     is_admin = bool(await get_admin(callback.from_user.id))
     if not is_admin:
-        await callback.answer("У вас нет прав для просмотра этой информации.", show_alert=True)
-        return
+        user = await get_user(callback.from_user.id)
+        if not user or user[2] != 'seller':
+            await callback.answer("Для просмотра точек необходимо подтверждение. Для подтверждения отпишите в лс Захару Мерзлякову в Яндекс Телемосте", show_alert=True)
+            return
         
     query = callback.data.replace("point_info_", "").strip().replace('\xa0', ' ')
     key, pt = get_point_info(query)
@@ -900,6 +930,7 @@ async def cb_point_info(callback: types.CallbackQuery):
 async def btn_salary(message: types.Message):
     user = await get_user(message.from_user.id)
     if not user: return
+    name, role, status = user
     today = date.today()
     if 10 <= today.day < 25: start, end = today.replace(day=10), today.replace(day=25)
     elif today.day >= 25: start = today.replace(day=25); end = date(today.year+1,1,10) if today.month==12 else date(today.year,today.month+1,10)
@@ -912,7 +943,7 @@ async def btn_salary(message: types.Message):
         async with db.execute("SELECT COUNT(*) FROM shifts WHERE user_id = ? AND date >= ? AND date < ?", (message.from_user.id, s_str, e_str)) as cur:
             count = (await cur.fetchone())[0]
 
-    try: rate = int(user[1])
+    try: rate = int(role)
     except: rate = 0
     base = count * rate
     fines = await get_transactions_sum(message.from_user.id, s_str, e_inc, "fine")
@@ -1035,6 +1066,54 @@ async def process_import_date(message: types.Message, state: FSMContext):
     _, msg = await process_and_save_sheet(m, y, is_auto=False)
     await message.answer(msg, reply_markup=get_admin_inline_kb())
     await state.clear()
+
+# 🆕 УТВЕРЖДЕНИЕ ПРОДАВЦА
+@dp.callback_query(F.data == "adm_approve_seller")
+async def cb_adm_approve_seller(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and not await get_admin(callback.from_user.id):
+        await callback.answer("Нет прав.", show_alert=True)
+        return
+        
+    unapproved = await get_unapproved_users()
+    if not unapproved:
+        await callback.message.edit_text("Все пользователи уже подтверждены. Список пуст.", reply_markup=get_admin_inline_kb())
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for uid, name in unapproved:
+        builder.button(text=f"✅ {name}", callback_data=f"approve_{uid}")
+    builder.button(text="🔙 Назад", callback_data="admin_panel")
+    builder.adjust(1)
+    
+    await callback.message.edit_text("Нажми на фамилию, чтобы подтвердить пользователя как продавца:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("approve_"))
+async def cb_approve_user(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS and not await get_admin(callback.from_user.id):
+        return
+        
+    target_id = int(callback.data.split("_")[1])
+    await approve_user_status(target_id)
+    
+    # Уведомление юзеру
+    try:
+        await bot.send_message(target_id, "🎉 <b>Твой аккаунт подтвержден администратором!</b>\n\nТеперь тебе доступна кнопка «🗺 Точки».", parse_mode="HTML")
+    except: pass
+    
+    # Перерисовываем список
+    unapproved = await get_unapproved_users()
+    if not unapproved:
+        await callback.message.edit_text("✅ Все пользователи подтверждены!", reply_markup=get_admin_inline_kb())
+    else:
+        builder = InlineKeyboardBuilder()
+        for uid, name in unapproved:
+            builder.button(text=f"✅ {name}", callback_data=f"approve_{uid}")
+        builder.button(text="🔙 Назад", callback_data="admin_panel")
+        builder.adjust(1)
+        await callback.message.edit_text("Нажми на фамилию, чтобы подтвердить пользователя как продавца:", reply_markup=builder.as_markup())
+        
+    await callback.answer()
 
 @dp.callback_query(F.data == "adm_list_sellers")
 async def cb_adm_list_sellers(callback: types.CallbackQuery):
